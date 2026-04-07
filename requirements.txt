@@ -1,0 +1,5 @@
+langchain-core>=0.3.0
+langchain-openai>=0.2.0
+python-dotenv>=1.0.1
+python-frontmatter>=1.1.0
+langchain-mcp-adapters>=0.2.0

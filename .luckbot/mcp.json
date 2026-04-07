@@ -1,0 +1,10 @@
+{
+  "servers": {
+    "local_test": {
+      "transport": "stdio",
+      "command": "python",
+      "args": ["scripts/test_mcp_server.py"],
+      "cwd": "."
+    }
+  }
+}
