@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-import importlib.util
+import importlib
 import logging
 import os
+import sys
 from typing import Any, Callable
 
 from agent.plugin.base import LuckbotPlugin, PluginContext
@@ -71,22 +72,30 @@ class PluginManager:
 
     @staticmethod
     def _scan_dir(directory: str) -> list[LuckbotPlugin]:
+        """扫描目录下所有 *_plugin/ 包，加载并返回插件实例列表。
+
+        约定：每个 *_plugin/ 包的 __init__.py 中定义一个 LuckbotPlugin 子类。
+        """
         resolved = os.path.expanduser(directory)
         if not os.path.isdir(resolved):
             logger.debug("插件目录不存在: %s", resolved)
             return []
 
         found: list[LuckbotPlugin] = []
-        for filename in sorted(os.listdir(resolved)):
-            if not filename.endswith(".py") or filename.startswith("_"):
+        for name in sorted(os.listdir(resolved)):
+            if not name.endswith("_plugin"):
                 continue
-            filepath = os.path.join(resolved, filename)
+            pkg_path = os.path.join(resolved, name)
+            if not os.path.isdir(pkg_path):
+                continue
+            if not os.path.isfile(os.path.join(pkg_path, "__init__.py")):
+                continue
             try:
-                plugin = _load_plugin_file(filepath)
+                plugin = _load_plugin_package(resolved, name)
                 found.append(plugin)
-                logger.info("已从 %s 加载外部插件: %s", filepath, plugin.name)
+                logger.info("已从 %s 加载外部插件: %s", pkg_path, plugin.name)
             except Exception:
-                logger.exception("从 %s 加载插件失败", filepath)
+                logger.exception("从 %s 加载插件失败", pkg_path)
         return found
 
     # -- 依赖感知的拓扑排序 -----------------------------------------------
@@ -117,22 +126,31 @@ class PluginManager:
         return sorted_list
 
 
-def _load_plugin_file(filepath: str) -> LuckbotPlugin:
-    """动态加载 *filepath*，返回模块级变量 ``plugin``。"""
-    mod_name = os.path.splitext(os.path.basename(filepath))[0]
-    spec = importlib.util.spec_from_file_location(f"luckbot_ext.{mod_name}", filepath)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"无法为 {filepath} 创建模块 spec")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+def _load_plugin_package(parent_dir: str, pkg_name: str) -> LuckbotPlugin:
+    """动态加载外部 *_plugin/ 包，在 __init__.py 中查找 LuckbotPlugin 子类并实例化。
 
-    plugin = getattr(module, "plugin", None)
-    if plugin is None:
+    将 parent_dir 加入 sys.path，使包内的相对 import 正常工作。
+    """
+    if parent_dir not in sys.path:
+        sys.path.insert(0, parent_dir)
+
+    mod = importlib.import_module(pkg_name)
+    plugin_cls = _find_plugin_class(mod)
+    if plugin_cls is None:
         raise AttributeError(
-            f"插件文件 {filepath} 必须定义模块级变量「plugin」，且为 LuckbotPlugin 实例"
+            f"插件包 {pkg_name} 的 __init__.py 中未找到 LuckbotPlugin 子类"
         )
-    if not isinstance(plugin, LuckbotPlugin):
-        raise TypeError(
-            f"{filepath} 中的「plugin」必须是 LuckbotPlugin 实例，实际为 {type(plugin).__name__}"
-        )
-    return plugin
+    return plugin_cls()
+
+
+def _find_plugin_class(module: object) -> type[LuckbotPlugin] | None:
+    """在模块中查找第一个 LuckbotPlugin 子类（排除基类本身）。"""
+    for attr_name in dir(module):
+        attr = getattr(module, attr_name)
+        if (
+            isinstance(attr, type)
+            and issubclass(attr, LuckbotPlugin)
+            and attr is not LuckbotPlugin
+        ):
+            return attr
+    return None

@@ -65,6 +65,7 @@ class AfterLLMCallInput:
 class BeforeToolCallInput:
     name: str
     args: dict[str, Any]
+    tool_call_id: str = ""
 
 
 @dataclass
@@ -78,6 +79,7 @@ class AfterToolCallInput:
     name: str
     args: dict[str, Any]
     output: str
+    tool_call_id: str = ""
 
 
 @dataclass

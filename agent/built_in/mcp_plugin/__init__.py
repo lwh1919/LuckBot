@@ -44,8 +44,10 @@ class MCPPlugin(LuckbotPlugin):
             return None
 
         mtime = os.stat(self._config_path).st_mtime
-        if mtime == self._config_mtime and len(self._cached_tools) > 0:
-            return BeforeRunResult(tools={**inp.tools, **self._cached_tools})
+        if mtime == self._config_mtime and self._cached_tools:
+            merged_tools = dict(inp.tools)
+            merged_tools.update(self._cached_tools)
+            return BeforeRunResult(tools=merged_tools)
 
         try:
             with open(self._config_path, encoding="utf-8") as f:
@@ -58,7 +60,7 @@ class MCPPlugin(LuckbotPlugin):
         if not isinstance(servers, dict):
             logger.warning("MCP 配置缺少有效的「servers」对象")
             return None
-        if len(servers) == 0:
+        if not servers:
             logger.warning("MCP 配置中的「servers」为空")
             return None
 
@@ -68,7 +70,9 @@ class MCPPlugin(LuckbotPlugin):
 
         if not self._cached_tools:
             return None
-        return BeforeRunResult(tools={**inp.tools, **self._cached_tools})
+        merged_tools = dict(inp.tools)
+        merged_tools.update(self._cached_tools)
+        return BeforeRunResult(tools=merged_tools)
 
     # -- 内部 ---------------------------------------------------------------
 

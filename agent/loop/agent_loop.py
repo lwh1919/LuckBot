@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from langchain_core.messages import (
@@ -38,7 +39,6 @@ async def agent_loop(
     plugin_manager: PluginManager,
     *,
     system_prompt: str,
-    tools: dict[str, Any] | None = None,
     max_steps: int = DEFAULT_MAX_STEPS,
 ) -> str:
     """完整 Agent 运行入口。
@@ -46,13 +46,14 @@ async def agent_loop(
     任何调用方（CLI / API / 测试）只需调此函数，
     即可获得 before_run → ReAct → after_run 的完整 hook 语义。
     """
-    if tools is not None:
-        current_tools: dict[str, Any] = dict(tools)
+    if plugin_manager.get_tools() is not None:
+        current_tools: dict[str, Any] = plugin_manager.get_tools()
     else:
         current_tools = {}
     current_prompt = system_prompt
 
     # ── before_run ──────────────────────────────────────────────
+    # 按顺序调用所有 before_run 钩子，并允许它们改 current_tools / current_prompt，改完再进 _react_loop 和 LLM 对话
     for hook in plugin_manager.get_hooks("before_run"):
         result = await hook(
             BeforeRunInput(tools=current_tools, system_prompt=current_prompt)
@@ -136,54 +137,69 @@ async def _react_loop(
                 )
             )
 
-        # ④ 无 tool call → 结束
+        # ④ 无 tool call → 结束（可将 content 视为最终回答）
         if not response.tool_calls:
-            if response.content is None:
-                final_text = ""
-            elif isinstance(response.content, str):
-                final_text = response.content
-            else:
-                final_text = str(response.content)
+            content = response.content or ""
+            final_text = content if isinstance(content, str) else str(content)
             return final_text, messages
 
-        # ⑤ 执行每个 tool call
+        # ⑤ tool calls 并发执行
+        pending = []
         for tc in response.tool_calls:
-            tool_name: str = tc["name"]
-            tool_args: dict[str, Any] = tc["args"]
+            pending.append(_run_one_tool(tc, current_tools, plugin_manager))
+        tool_messages = await asyncio.gather(*pending, return_exceptions=True)
 
-            for hook in plugin_manager.get_hooks("before_tool_call"):
-                result = await hook(
-                    BeforeToolCallInput(name=tool_name, args=tool_args)
+        n_calls = len(response.tool_calls)
+        for i in range(n_calls):
+            tc = response.tool_calls[i]
+            msg = tool_messages[i]
+            if isinstance(msg, Exception):
+                messages.append(
+                    ToolMessage(content=f"工具异常: {msg}", tool_call_id=tc["id"])
                 )
-                if result is not None and result.args is not None:
-                    tool_args = result.args
-
-            tool_fn = current_tools.get(tool_name)
-            if tool_fn is None:
-                output = f"错误：未知工具「{tool_name}」"
             else:
-                try:
-                    raw = await tool_fn.ainvoke(tool_args)
-                    if isinstance(raw, str):
-                        output = raw
-                    else:
-                        output = str(raw)
-                except Exception as exc:
-                    output = f"执行工具「{tool_name}」时出错: {exc}"
-
-            for hook in plugin_manager.get_hooks("after_tool_call"):
-                result = await hook(
-                    AfterToolCallInput(
-                        name=tool_name, args=tool_args, output=output
-                    )
-                )
-                if result is not None and result.output is not None:
-                    output = result.output
-
-            messages.append(
-                ToolMessage(content=output, tool_call_id=tc["id"])
-            )
+                messages.append(msg)
 
         steps += 1
 
     return "已达最大步数，任务可能未完成。", messages
+
+
+async def _run_one_tool(
+    tc: dict[str, Any],
+    current_tools: dict[str, Any],
+    plugin_manager: PluginManager,
+) -> ToolMessage:
+    """执行单个 tool call（含 before/after hook），供 asyncio.gather 并发调用。"""
+    tool_name: str = tc["name"]
+    tool_args: dict[str, Any] = tc["args"]
+    tool_call_id: str = tc["id"]
+
+    for hook in plugin_manager.get_hooks("before_tool_call"):
+        result = await hook(BeforeToolCallInput(
+            name=tool_name, args=tool_args, tool_call_id=tool_call_id,
+        ))
+        if result is not None and result.args is not None:
+            tool_args = result.args
+
+    tool_fn = current_tools.get(tool_name)
+    if tool_fn is None:
+        output = f"错误：未知工具「{tool_name}」"
+    else:
+        try:
+            raw = await tool_fn.ainvoke(tool_args)
+            output = raw if isinstance(raw, str) else str(raw)
+        except Exception as exc:
+            output = f"执行工具「{tool_name}」时出错: {exc}"
+
+    for hook in plugin_manager.get_hooks("after_tool_call"):
+        result = await hook(
+            AfterToolCallInput(
+                name=tool_name, args=tool_args, output=output,
+                tool_call_id=tool_call_id,
+            )
+        )
+        if result is not None and result.output is not None:
+            output = result.output
+
+    return ToolMessage(content=output, tool_call_id=tc["id"])
