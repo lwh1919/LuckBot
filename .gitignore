@@ -41,3 +41,7 @@ Desktop.ini
 *.swp
 *.swo
 *.orig
+
+# ── LuckBot 本地运行产物 / 配置（保留目录名）────────────────────────────────
+.luckbot/*
+!.luckbot/
