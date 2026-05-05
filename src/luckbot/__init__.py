@@ -1,0 +1,1 @@
+"""LuckBot package."""

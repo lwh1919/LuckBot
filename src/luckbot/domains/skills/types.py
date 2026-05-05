@@ -1,0 +1,62 @@
+"""Skill 系统数据类定义。"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+
+@dataclass
+class SkillDoc:
+    """自动扫描到的参考文档（skill 目录下排除 SKILL.md 的 .md 文件）。"""
+
+    name: str
+    """文档稳定标识：相对 skill 根目录的路径（统一使用 `/`）。"""
+    description: str
+    path: str
+
+
+@dataclass
+class SkillInfo:
+    """从 SKILL.md 解析出的技能元信息。"""
+
+    name: str
+    description: str
+    content: str
+    location: str
+    base_dir: str
+    when_to_use: str | None
+    docs: list[SkillDoc] = field(default_factory=list)
+
+
+@dataclass
+class RemoteSkillRequest:
+    """单次 run 的远程/预置 skill 请求。"""
+
+    skill_name: str
+    docs: list[str] = field(default_factory=list)
+    source: str = "remote"
+
+
+@dataclass
+class ExecResult:
+    """skill_run 沙箱执行结果。"""
+
+    exit_code: int
+    stdout: str
+    stderr: str
+    timed_out: bool
+    duration_ms: int
+    output_files: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def returncode(self) -> int:
+        """兼容旧调用方。"""
+        return self.exit_code
+
+
+@dataclass
+class SkillState:
+    """CQRS 临时状态，每次 agent_loop 调用时重置。"""
+
+    loaded: dict[str, bool] = field(default_factory=dict)
+    selected_docs: dict[str, list[str]] = field(default_factory=dict)
