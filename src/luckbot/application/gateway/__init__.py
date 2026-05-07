@@ -1,13 +1,14 @@
-"""Application services."""
-from .gateway_client import (
+"""Application-layer gateway client and local process control."""
+
+from .client import (
     GatewayClientError,
     GatewayClientResult,
     gateway_healthcheck,
     resolve_gateway_base_url,
-    send_gateway_command,
     send_gateway_turn,
+    use_gateway_base_url,
 )
-from .gateway_control import (
+from .control import (
     GatewayProcessStatus,
     read_gateway_logs,
     read_gateway_status,
@@ -23,8 +24,8 @@ __all__ = [
     "read_gateway_logs",
     "read_gateway_status",
     "resolve_gateway_base_url",
-    "send_gateway_command",
     "send_gateway_turn",
     "start_gateway_process",
     "stop_gateway_process",
+    "use_gateway_base_url",
 ]

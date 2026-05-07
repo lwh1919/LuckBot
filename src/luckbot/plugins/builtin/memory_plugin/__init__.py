@@ -12,20 +12,24 @@ import os
 import threading
 from typing import Any
 
+from langchain_core.tools import tool
+
 from luckbot.core.config.env_parse import env_int
 from luckbot.core.observability import (
     increment_counter,
-    log_event,
+    log_exception,
     record_exception,
     start_span,
 )
+from luckbot.core.runtime import current_runtime_context
 from luckbot.domains.memory.compaction import maybe_compact_before_llm
 from luckbot.domains.memory.embeddings import EmbeddingProvider, build_embedding_provider
 from luckbot.domains.memory.index_db import MemoryIndex
 from luckbot.domains.memory.memory_tools import build_memory_get_tool, build_memory_search_tool
-from luckbot.domains.memory.paths import ensure_memory_tree, owner_id_from_env, resolve_memory_paths
+from luckbot.domains.memory.paths import ensure_memory_tree, resolve_memory_paths
 from luckbot.domains.memory.session_memory import archive_last_session_to_markdown
 from luckbot.domains.memory.types import MemoryPaths
+from luckbot.domains.session import default_owner_id
 from luckbot.core.plugin.base import LuckbotPlugin, PluginContext
 from luckbot.core.plugin.hooks import (
     AfterRunInput,
@@ -44,7 +48,7 @@ MEMORY_RECALL = (
     "该工具会搜索长期记忆（MEMORY.md、memory/*.md、extra/*.md）；"
     "大多数情况下直接依据 search 返回的 snippet、score、source 回答即可；"
     "只有在需要回看记忆原文上下文、长文阅读、精确措辞确认或检索后仍低置信度时，再用 memory_get 拉取需要的行。"
-    "memory_get 读取的是记忆 Markdown，或显式回看的旧会话（path 形如 session:<session_id>），不直接返回 raw sessions/*.jsonl。"
+    "memory_get 读取的是长期记忆 Markdown，不读取 raw session transcript。"
     "检索后仍不确定请说明已检索过。\n\n"
 )
 
@@ -77,7 +81,6 @@ class MemoryPlugin(LuckbotPlugin):
 
     async def initialize(self, ctx: PluginContext) -> None:
         if not _memory_enabled():
-            logger.info("MemoryPlugin 已禁用（LUCKBOT_MEMORY_ENABLED）")
             return
 
         self._ctx = ctx
@@ -90,6 +93,8 @@ class MemoryPlugin(LuckbotPlugin):
             dim = parsed if parsed > 0 else None
         self._provider = prov
         self._embedding_dim = dim
+        ctx.register_tool("memory_search", self._build_owner_aware_memory_search_tool())
+        ctx.register_tool("memory_get", self._build_owner_aware_memory_get_tool())
         ctx.register_service("memory_sync_now", self._sync_now)
 
         ctx.register_hook("before_run", self._before_run)
@@ -111,7 +116,6 @@ class MemoryPlugin(LuckbotPlugin):
             from watchdog.events import FileSystemEventHandler
             from watchdog.observers import Observer
         except ImportError:
-            logger.info("未安装 watchdog，跳过 memory 目录监听")
             return
 
         mem_root = self._paths.memory_root
@@ -155,7 +159,6 @@ class MemoryPlugin(LuckbotPlugin):
         obs.schedule(_H(), mem_root, recursive=True)
         obs.start()
         self._observer = obs
-        logger.info("已启动 memory 目录监听: %s", mem_root)
 
     async def destroy(self, ctx: PluginContext) -> None:  # noqa: ARG002
         """插件卸载：停监听、关 SQLite。"""
@@ -173,7 +176,7 @@ class MemoryPlugin(LuckbotPlugin):
         self._paths = None
 
     def _activate_owner(self, owner_id: str | None) -> tuple[MemoryPaths, MemoryIndex, Any, Any]:
-        effective_owner = (owner_id or "").strip() or owner_id_from_env()
+        effective_owner = default_owner_id(owner_id or "local")
         cached = self._runtime_state.get(effective_owner)
         if cached is None:
             with start_span(
@@ -198,20 +201,46 @@ class MemoryPlugin(LuckbotPlugin):
         self._paths, self._index, _search_tool, _get_tool = cached
         return cached
 
+    def _current_owner_id(self) -> str | None:
+        runtime_ctx = current_runtime_context()
+        if runtime_ctx is None:
+            return None
+        return runtime_ctx.owner_id
+
+    def _build_owner_aware_memory_search_tool(self) -> Any:
+        @tool
+        async def memory_search(query: str, limit: int = 5) -> str:
+            """搜索长期记忆（MEMORY.md、memory/*.md、extra/*.md），返回相关片段。"""
+            _paths, _index, search_tool, _get_tool = self._activate_owner(
+                self._current_owner_id()
+            )
+            return await search_tool.ainvoke({"query": query, "limit": limit})
+
+        return memory_search
+
+    def _build_owner_aware_memory_get_tool(self) -> Any:
+        @tool
+        async def memory_get(path: str, from_line: int = 0, lines: int = 0) -> str:
+            """读取长期记忆 Markdown。"""
+            _paths, _index, _search_tool, get_tool = self._activate_owner(
+                self._current_owner_id()
+            )
+            return await get_tool.ainvoke(
+                {"path": path, "from_line": from_line, "lines": lines}
+            )
+
+        return memory_get
+
     async def _before_run(self, inp: BeforeRunInput) -> BeforeRunResult | None:
         """首轮运行前追加 Memory Recall 提示词。"""
         if not _memory_enabled():
             return None
         with start_span(
             "memory.before_run",
-            attributes={"luckbot.owner_id": inp.owner_id or owner_id_from_env()},
+            attributes={"luckbot.owner_id": default_owner_id(inp.owner_id or "local")},
         ):
-            _paths, _index, search_tool, get_tool = self._activate_owner(inp.owner_id)
-            tools = dict(inp.tools)
-            tools["memory_search"] = search_tool
-            tools["memory_get"] = get_tool
+            self._activate_owner(inp.owner_id)
             return BeforeRunResult(
-                tools=tools,
                 system_prompt=inp.system_prompt + "\n\n" + MEMORY_RECALL,
             )
 
@@ -225,7 +254,7 @@ class MemoryPlugin(LuckbotPlugin):
             return None
         with start_span(
             "memory.compaction.check",
-            attributes={"luckbot.owner_id": inp.owner_id or owner_id_from_env()},
+            attributes={"luckbot.owner_id": default_owner_id(inp.owner_id or "local")},
         ):
             self._activate_owner(inp.owner_id)
             if not self._paths:
@@ -247,7 +276,7 @@ class MemoryPlugin(LuckbotPlugin):
                 increment_counter("luckbot_memory_sync_total")
             except Exception as exc:
                 record_exception(exc)
-                logger.exception("memory sync 失败")
+                log_exception(logger, "memory.sync_failed", exc)
 
 
 __all__ = ["MemoryPlugin", "archive_last_session_to_markdown"]

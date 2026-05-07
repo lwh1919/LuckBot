@@ -12,6 +12,7 @@ from uuid import UUID, uuid4
 
 from luckbot.core.observability.context import current_observability_context
 from luckbot.core.observability.settings import load_observability_settings
+from luckbot.core.observability.telemetry import log_exception
 
 try:
     from langsmith import Client
@@ -92,8 +93,8 @@ class LangSmithRunHandle:
                 error=error,
                 end_time=datetime.now(timezone.utc),
             )
-        except Exception:
-            logger.exception("LangSmith update_run 失败: name=%s", self.name)
+        except Exception as exc:
+            log_exception(logger, "langsmith.update_run_failed", exc, name=self.name)
 
 
 @asynccontextmanager
@@ -156,8 +157,8 @@ async def start_langsmith_run(
             extra={"metadata": merged_metadata},
             tags=merged_tags,
         )
-    except Exception:
-        logger.exception("LangSmith create_run 失败: name=%s", name)
+    except Exception as exc:
+        log_exception(logger, "langsmith.create_run_failed", exc, name=name)
         yield LangSmithRunHandle()
         return
 

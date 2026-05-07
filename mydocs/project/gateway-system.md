@@ -9,7 +9,7 @@
 - FastAPI gateway 自身
 - Feishu adapter
 - CLI remote over gateway
-- dispatcher / service 与 runtime 的关系
+- dispatcher / application turn runner 与 runtime 的关系
 
 ## 模块职责
 
@@ -18,8 +18,8 @@
 - 暴露长期运行的 HTTP 服务
 - 接收飞书 webhook
 - 接收 CLI remote 请求
-- 把外部输入规范化为统一 `IncomingEnvelope`
-- 调度一次 LuckBot runtime 执行
+- 把外部输入规范化为统一 `IncomingTurn`
+- 通过统一 `AgentTurnRunner` 调度一次 LuckBot 执行
 - 对同一逻辑会话做基础并发保护
 
 ## 当前真实行为
@@ -35,12 +35,14 @@
 - `GET /healthz`
 - `POST /webhooks/feishu/events`
 - `POST /gateway/cli/turn`
-- `POST /gateway/cli/command`
+
+其中 `/gateway/cli/turn` 可以通过 `LUCKBOT_GATEWAY_SERVER_KEY` 开启简单 Bearer key 校验。
+`/healthz` 不校验，飞书 webhook 继续使用飞书自己的 token / app_id 校验。
 
 所以当前 gateway 不是“只有飞书接入”，而是：
 
 - 飞书远程入口
-- CLI 通过 `--gateway` 复用的本地 HTTP 入口
+- CLI 通过 `luckbot gateway` 复用的本地 HTTP 入口
 
 ### 2. gateway 当前是 FastAPI 外层接入，不属于 plugin system
 
@@ -56,12 +58,10 @@ gateway 位于：
   - FastAPI 入口与路由
 - `dispatcher.py`
   - 平台无关的调度与并发保护
-- `service.py`
-  - 把统一消息转成一次 LuckBot runtime 调用
 - `feishu/`
   - 飞书协议适配与 OpenAPI client
 - `types.py`
-  - `IncomingEnvelope`、`OutboundTarget` 等统一协议
+  - gateway adapter / runner 协议；turn 数据结构来自 `luckbot.application.turns`
 
 ### 3. Feishu 当前只支持文本消息主流程
 
@@ -89,17 +89,18 @@ gateway 位于：
 
 - 私聊 session：`feishu:<open_id>`
 - 群聊 session：`feishu:group:<chat_id>:<open_id>`
-- owner：`feishu:user:<open_id>`
+- owner：`LUCKBOT_OWNER_ID`；未设置时 fallback `feishu:user:<open_id>`
 
 CLI remote 当前映射为：
 
 - session：`gateway:cli:<session_name>`
-- owner：默认 `local`
+- owner：`LUCKBOT_OWNER_ID`；未设置时使用请求 owner，仍为空则 fallback `local`
 
 所以当前事实是：
 
 - gateway CLI 与本地 CLI transcript 不共享
-- 但 gateway CLI 与本地 CLI 默认共享长期记忆 owner `local`
+- 不同 channel 的 session 不共享
+- 单用户部署下，CLI 与飞书可通过相同 `LUCKBOT_OWNER_ID` 共享长期记忆
 
 ### 5. dispatcher 对 Feishu 和 CLI remote 的执行模式不同
 
@@ -117,23 +118,58 @@ CLI remote 当前映射为：
 - 同一 `session_key` 已在执行时会拒绝新请求
 - 当前并发保护是进程内字典级别，不是分布式锁
 
-### 6. service 复用统一 runtime，不维护第二套 agent loop
+### 6. gateway 复用统一 AgentTurnRunner，不维护第二套 agent loop
 
-桥接层位于：
+统一执行层位于：
 
-- `src/luckbot/adapters/gateway/service.py`
+- `src/luckbot/application/turn_runner.py`
+- `src/luckbot/application/turns.py`
 
 当前会：
 
+- 接收 `IncomingTurn`
 - 用 `PluginManager` 装配内置插件与项目级 `.luckbot/plugins`
 - 先尝试执行 slash command
 - 否则调用 `run_runtime()`
 
-所以当前 gateway 没有独立 agent loop，只是 runtime 的另一种入口。
+所以当前 gateway 没有独立 service / agent loop，只是把平台输入转成 `IncomingTurn` 后交给 application 层。
 
-### 7. gateway 默认也使用项目级 `.luckbot` 配置与 state
+### 7. CLI 侧 gateway 应用层负责连接 gateway bot
 
-当前 gateway service 默认从项目根解析：
+CLI 侧 gateway 应用层位于：
+
+- `src/luckbot/application/gateway/client.py`
+- `src/luckbot/application/gateway/control.py`
+
+其中：
+
+- `client.py`
+  - 负责本地 CLI 到 gateway bot 的 HTTP 调用
+  - 当前使用 `/gateway/cli/turn` 与 `/healthz`
+  - `luckbot gateway` 不带 URL 时，默认启动或复用本机 gateway
+  - `luckbot gateway <url>` 带 URL 时，只连接外部 gateway bot，不启动本机 gateway
+  - 若设置 `LUCKBOT_GATEWAY_CLIENT_KEY`，请求会携带 `Authorization: Bearer <key>`
+- `control.py`
+  - 只负责本地开发 / 本地常驻 gateway 的进程管理
+  - 维护 pid、state 与 log 文件
+
+所以这层不是 gateway 服务端，也不是 plugin service。
+它是 CLI 侧的 application gateway adapter，用于把本地 CLI 操作转换为 gateway bot 调用。
+
+当前 gateway CLI 相关环境变量：
+
+- `LUCKBOT_GATEWAY_URL`
+  - client 连接的 gateway base URL；`luckbot gateway <url>` 会在本次进程内覆盖它
+- `LUCKBOT_GATEWAY_CLIENT_KEY`
+  - client 连接密钥，会作为 Bearer token 发到 `/gateway/cli/turn`
+- `LUCKBOT_GATEWAY_SERVER_KEY`
+  - gateway server 被连接密钥；为空时不启用 CLI remote 鉴权
+- `LUCKBOT_GATEWAY_HOST` / `LUCKBOT_GATEWAY_PORT`
+  - 本地 gateway 监听地址与端口
+
+### 8. gateway 默认也使用项目级 `.luckbot` 配置与 state
+
+当前 `AgentTurnRunner` 默认从项目根解析：
 
 - `.luckbot/plugins`
 
@@ -143,30 +179,33 @@ session / memory / gateway 自身运行态默认落在：
 - `.luckbot/state/memory`
 - `.luckbot/state/gateway`
 
-所以从 repo 外 cwd 启动 `luckbot` 或 gateway 时，项目级配置与运行态仍会落到同一个项目根。
+所以从 repo 外 cwd 启动 `luckbot` 或后台 gateway 时，项目级配置与运行态仍会落到同一个项目根。
 
-### 8. 当前请求级身份透传已经打通到 runtime / session / memory
+### 9. 当前请求级身份透传已经打通到 runtime / session / memory
 
 当前 gateway 会把这些字段透传到统一 runtime：
 
 - `session_key`
 - `owner_id`
-- `platform`
-- `chat_type`
+- `channel`，进入 runtime 后映射为观测 `platform`
 - `chat_id`
 - `user_id`
-- `message_id`
+- `message_id`，进入 runtime 后映射为 `gateway_message_id`
+
+`transport` 当前用于 `CommandContext`，不进入 `RuntimeContext`。
 
 因此当前 `SessionPlugin` 与 `MemoryPlugin` 会优先使用本次请求传入的身份，而不是只依赖环境变量默认值。
+gateway dispatcher 的 observability attrs 也会显式合并 `session_key` / `owner_id`，但这些字段不存入 `ObservabilityContext`。
 
 ## 关键入口
 
 - `src/luckbot/adapters/gateway/app.py`
 - `src/luckbot/adapters/gateway/dispatcher.py`
-- `src/luckbot/adapters/gateway/service.py`
 - `src/luckbot/adapters/gateway/types.py`
 - `src/luckbot/adapters/gateway/feishu/adapter.py`
 - `src/luckbot/adapters/gateway/feishu/client.py`
+- `src/luckbot/application/turns.py`
+- `src/luckbot/application/turn_runner.py`
 
 ## 边界
 

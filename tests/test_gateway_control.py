@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import importlib
+from types import SimpleNamespace
 
 import pytest
 
-gateway_control_module = importlib.import_module("luckbot.application.services.gateway_control")
+gateway_control_module = importlib.import_module("luckbot.application.gateway.control")
+cli_module = importlib.import_module("luckbot.entrypoints.cli")
 
 
 class _FakePopen:
@@ -42,3 +44,41 @@ def test_gateway_control_start_and_stop_manage_runtime_files(
     assert stopped.running is False
     assert terminated == [(43210, False)]
     assert not gateway_control_module.gateway_pid_path().exists()
+
+
+def test_gateway_cli_without_url_starts_local_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    async def _fake_chat_gateway() -> None:
+        calls.append("chat")
+
+    monkeypatch.setattr(cli_module, "_ensure_gateway_running", lambda: calls.append("start"))
+    monkeypatch.setattr(cli_module, "async_chat_gateway", _fake_chat_gateway)
+
+    cli_module._run_gateway_from_args(SimpleNamespace(target=None, follow=False))
+
+    assert calls == ["start", "chat"]
+
+
+def test_gateway_cli_with_url_skips_local_autostart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    async def _fake_chat_gateway() -> None:
+        calls.append("chat")
+
+    def _fail_start() -> None:
+        raise AssertionError("remote gateway should not start local gateway")
+
+    monkeypatch.setattr(cli_module, "_ensure_gateway_running", _fail_start)
+    monkeypatch.setattr(cli_module, "async_chat_gateway", _fake_chat_gateway)
+    monkeypatch.setattr(cli_module, "use_gateway_base_url", lambda url: calls.append(f"url:{url}"))
+
+    cli_module._run_gateway_from_args(
+        SimpleNamespace(target="http://gateway.example:8000", follow=False)
+    )
+
+    assert calls == ["url:http://gateway.example:8000", "chat"]

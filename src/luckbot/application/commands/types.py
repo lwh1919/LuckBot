@@ -19,6 +19,7 @@ class CommandSpec:
 
 @dataclass(slots=True)
 class CommandContext:
+    channel: str
     transport: str
     plugin_manager: Any
     conversation_history: list[Any]
@@ -31,4 +32,3 @@ class CommandResult:
     handled: bool
     final_text: str = ""
     updated_conversation_history: list[Any] | None = None
-

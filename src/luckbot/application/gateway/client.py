@@ -1,4 +1,4 @@
-"""HTTP client for talking to a running LuckBot gateway."""
+"""CLI-side HTTP client for talking to a LuckBot gateway bot."""
 
 from __future__ import annotations
 
@@ -63,22 +63,11 @@ def send_gateway_turn(
     )
 
 
-def send_gateway_command(
-    command: str,
-    *,
-    session_name: str | None = None,
-    owner_id: str | None = None,
-    trace_id: str | None = None,
-) -> GatewayClientResult:
-    return _post_gateway_json(
-        "/gateway/cli/command",
-        {
-            "text": command,
-            "session_key": normalize_session_name(session_name),
-            "owner_id": owner_id,
-            "trace_id": trace_id,
-        },
-    )
+def use_gateway_base_url(url: str) -> None:
+    normalized = url.strip().rstrip("/")
+    if not normalized:
+        raise GatewayClientError("gateway URL 不能为空")
+    os.environ["LUCKBOT_GATEWAY_URL"] = normalized
 
 
 def gateway_healthcheck() -> dict[str, Any]:
@@ -101,7 +90,7 @@ def _post_gateway_json(path: str, payload: dict[str, Any]) -> GatewayClientResul
     request = urllib.request.Request(
         url,
         data=body,
-        headers={"Content-Type": "application/json"},
+        headers=_gateway_headers(),
         method="POST",
     )
 
@@ -120,6 +109,14 @@ def _post_gateway_json(path: str, payload: dict[str, Any]) -> GatewayClientResul
     except json.JSONDecodeError as exc:
         raise GatewayClientError("gateway 返回了无效 JSON") from exc
     return GatewayClientResult(final_text=str(parsed.get("final_text") or ""), payload=parsed)
+
+
+def _gateway_headers() -> dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    key = (os.getenv("LUCKBOT_GATEWAY_CLIENT_KEY") or "").strip()
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    return headers
 
 
 def _decode_error_payload(exc: urllib.error.HTTPError) -> dict[str, Any]:

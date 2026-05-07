@@ -58,18 +58,12 @@ class SkillWorkspace:
         self._stage_skill(skill_name, skill_base_dir)
 
         if script_content:
-            work_dir = os.path.join(root, "work")
-            script_path = os.path.join(work_dir, "_script.py")
-            with open(script_path, "w", encoding="utf-8") as f:
-                f.write(script_content)
+            script_path = self._write_script(script_content)
             if not command:
                 command = f"python3 {script_path}"
 
         if not command:
-            return ExecResult(
-                exit_code=-1, stdout="", stderr="错误：command 和 script_content 至少需要提供一个。",
-                timed_out=False, duration_ms=0, output_files={},
-            )
+            return _error_result("错误：command 和 script_content 至少需要提供一个。")
 
         run_id = f"run_{uuid.uuid4().hex[:8]}"
         run_dir = os.path.join(root, "runs", run_id)
@@ -78,14 +72,7 @@ class SkillWorkspace:
         skill_staged = os.path.join(root, "skills", skill_name)
         work_cwd = self._resolve_cwd(skill_staged, cwd)
         if work_cwd is None:
-            return ExecResult(
-                exit_code=-1,
-                stdout="",
-                stderr=f"错误：cwd 超出 skill 工作目录范围: {cwd}",
-                timed_out=False,
-                duration_ms=0,
-                output_files={},
-            )
+            return _error_result(f"错误：cwd 超出 skill 工作目录范围: {cwd}")
 
         proc_env = self._build_env(skill_name, run_dir, env)
 
@@ -126,7 +113,6 @@ class SkillWorkspace:
         """销毁整个工作空间临时目录。"""
         if self._root is not None and os.path.isdir(self._root):
             shutil.rmtree(self._root, ignore_errors=True)
-            logger.info("已清理工作空间: %s", self._root)
             self._root = None
             self._staged_digests.clear()
 
@@ -138,8 +124,14 @@ class SkillWorkspace:
         self._root = tempfile.mkdtemp(prefix="luckbot_ws_")
         for sub in ("skills", "out", "work", "runs"):
             os.makedirs(os.path.join(self._root, sub), exist_ok=True)
-        logger.info("创建工作空间: %s", self._root)
         return self._root
+
+    def _write_script(self, script_content: str) -> str:
+        work_dir = os.path.join(self._ensure_root(), "work")
+        script_path = os.path.join(work_dir, "_script.py")
+        with open(script_path, "w", encoding="utf-8") as handle:
+            handle.write(script_content)
+        return script_path
 
     def _stage_skill(self, skill_name: str, skill_base_dir: str) -> None:
         """增量暂存：目录哈希不变则跳过。"""
@@ -156,7 +148,6 @@ class SkillWorkspace:
         self._link_workspace_dirs(dest)
         self._set_readonly(dest)
         self._staged_digests[skill_name] = digest
-        logger.info("已暂存技能 %s → %s", skill_name, dest)
 
     def _link_workspace_dirs(self, skill_dest: str) -> None:
         """创建 out/ 和 work/ 符号链接指向工作空间共享目录。"""
@@ -269,3 +260,14 @@ def _compute_dir_digest(directory: str) -> str:
             except OSError:
                 pass
     return h.hexdigest()
+
+
+def _error_result(stderr: str) -> ExecResult:
+    return ExecResult(
+        exit_code=-1,
+        stdout="",
+        stderr=stderr,
+        timed_out=False,
+        duration_ms=0,
+        output_files={},
+    )

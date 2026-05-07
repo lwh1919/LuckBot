@@ -16,6 +16,7 @@ from typing import Any
 import frontmatter
 
 from luckbot.core.config import resolve_project_path
+from luckbot.core.observability import log_exception
 
 from .types import SkillDoc, SkillInfo
 
@@ -25,17 +26,10 @@ _Fingerprint = tuple[tuple[str, float, int], ...]
 
 _DEFAULT_PROJECT_SCAN_PATHS = [
     ".luckbot/skills",
-    ".agents/skills",
-    ".pulse-coder/skills",
-    ".coder/skills",
-    ".claude/skills",
 ]
 
 _DEFAULT_USER_SCAN_PATHS = [
     os.path.expanduser("~/.luckbot/skills"),
-    os.path.expanduser("~/.pulse-coder/skills"),
-    os.path.expanduser("~/.coder/skills"),
-    os.path.expanduser("~/.claude/skills"),
 ]
 
 
@@ -54,9 +48,6 @@ class SkillRegistry:
 
     def resolve(self, name: str) -> SkillInfo | None:
         return self._skills.get(name)
-
-    def has(self, name: str) -> bool:
-        return name in self._skills
 
     def doc_names(self, skill_name: str) -> list[str]:
         skill = self._skills.get(skill_name)
@@ -79,17 +70,16 @@ class SkillRegistry:
             logger.warning("无法读取文档 %s", doc.path)
             return None
 
-    def validate_docs(self, skill_name: str, docs: list[str]) -> tuple[bool, list[str]]:
-        """校验 docs 是否全部存在。"""
+    def invalid_docs(self, skill_name: str, docs: list[str]) -> list[str]:
+        """返回不存在的 doc 引用。"""
         skill = self._skills.get(skill_name)
         if skill is None:
-            return (False, list(docs))
-        invalid: list[str] = []
-        for doc_name in docs:
-            resolved = _resolve_doc_ref(skill.docs, doc_name)
-            if resolved is None:
-                invalid.append(doc_name)
-        return (len(invalid) == 0, invalid)
+            return list(docs)
+        return [
+            doc_name
+            for doc_name in docs
+            if _resolve_doc_ref(skill.docs, doc_name) is None
+        ]
 
     def refresh_if_changed(self) -> bool:
         """检查指纹，有变化则重新扫描。返回是否刷新。"""
@@ -147,10 +137,9 @@ class SkillRegistry:
                         continue
                     if info.name not in seen:
                         seen[info.name] = info
-                except Exception:
-                    logger.exception("解析 skill 文件失败: %s", filepath)
+                except Exception as exc:
+                    log_exception(logger, "skill.parse_failed", exc, path=filepath)
         self._skills = seen
-        logger.info("已扫描 %d 个 skill", len(seen))
 
 
 # -- 解析辅助 -----------------------------------------------------------
@@ -221,21 +210,12 @@ def _scan_docs(skill_dir: str) -> list[SkillDoc]:
 
 
 def _resolve_doc_ref(docs: list[SkillDoc], doc_name: str) -> SkillDoc | None:
-    """优先按相对路径精确匹配；basename 仅在唯一时作为兼容入口。"""
+    """按相对路径精确匹配文档。"""
     wanted = doc_name.strip().replace("\\", "/")
     if not wanted:
         return None
 
-    exact_matches = [doc for doc in docs if doc.name == wanted]
-    if exact_matches:
-        return exact_matches[0]
-
-    basename_matches = [
-        doc for doc in docs if os.path.basename(doc.name) == wanted
-    ]
-    if len(basename_matches) == 1:
-        return basename_matches[0]
-    return None
+    return next((doc for doc in docs if doc.name == wanted), None)
 
 
 def _extract_doc_description(filepath: str, fallback: str) -> str:

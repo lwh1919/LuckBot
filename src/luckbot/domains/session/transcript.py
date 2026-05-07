@@ -5,8 +5,8 @@
 仅对白名单内部消息（如 compaction 摘要）例外。
 
 与 ``state.transcript_path(session_id)`` 配合：文件名使用 ``session_id``，而非 ``session_key``。
-本模块不再维护 ``sessions/*.md`` 检索视图；需要显式回看旧会话时，由工具直接把
-``sessions/<session_id>.jsonl`` 解析成文本返回，规范读取 path 为 ``session:<session_id>``。
+本模块不再维护 ``sessions/*.md`` 检索视图；需要显式回看旧会话时，可把
+``sessions/<session_id>.jsonl`` 解析成文本返回。规范读取 path 为 ``session:<session_id>``。
 """
 
 from __future__ import annotations
@@ -55,6 +55,70 @@ def _tool_calls_from_message(msg: AIMessage) -> list[dict[str, Any]]:
     return [_normalize_tool_call(c) for c in tc if isinstance(c, dict)]
 
 
+def _tool_call_ids(msg: AIMessage) -> list[str]:
+    calls = _tool_calls_from_message(msg)
+    out: list[str] = []
+    for call in calls:
+        tid = call["id"].strip()
+        if tid:
+            out.append(tid)
+    return out
+
+
+def normalize_transcript_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
+    """过滤不满足 LLM tool-call 配对约束的 transcript 消息。
+
+    ToolMessage 只能紧跟在带 tool_calls 的 AIMessage 后，并且必须完整覆盖该
+    AIMessage 声明的 tool_call id。非法工具调用片段整组丢弃，避免旧 transcript
+    污染下一轮 LLM 请求。
+    """
+    out: list[BaseMessage] = []
+    i = 0
+    n = len(messages)
+    while i < n:
+        msg = messages[i]
+        if isinstance(msg, HumanMessage):
+            out.append(msg)
+            i += 1
+            continue
+        if isinstance(msg, SystemMessage):
+            if is_compaction_summary_message(msg):
+                out.append(msg)
+            i += 1
+            continue
+        if isinstance(msg, ToolMessage):
+            i += 1
+            continue
+        if isinstance(msg, AIMessage):
+            expected_ids = _tool_call_ids(msg)
+            if not expected_ids:
+                out.append(msg)
+                i += 1
+                continue
+
+            expected = set(expected_ids)
+            seen: set[str] = set()
+            tools: list[ToolMessage] = []
+            invalid = len(expected) != len(expected_ids)
+            j = i + 1
+            while j < n and isinstance(messages[j], ToolMessage):
+                tool_msg = messages[j]
+                tid = str(getattr(tool_msg, "tool_call_id", "") or "").strip()
+                if not tid or tid not in expected or tid in seen:
+                    invalid = True
+                seen.add(tid)
+                tools.append(tool_msg)
+                j += 1
+
+            if not invalid and seen == expected:
+                out.append(msg)
+                out.extend(tools)
+            i = j
+            continue
+        i += 1
+    return out
+
+
 def session_read_path(session_id: str) -> str:
     """旧会话显式读取的规范 path。"""
     sid = session_id.strip()
@@ -77,45 +141,45 @@ def session_read_path_to_session_id(path: str) -> str | None:
     return sid
 
 
-def _msg_to_record(msg: BaseMessage, run_id: str) -> dict[str, Any] | None:
-    """单条 BaseMessage → 写入 JSONL 的一条 dict（含同一 run 内共享的 run_id）。"""
-    base = {"timestamp": time.time(), "run_id": run_id}
+def _message_payload(msg: BaseMessage) -> dict[str, Any] | None:
     if isinstance(msg, HumanMessage):
-        return {
-            **base,
-            "message": {"role": "user", "content": _as_text(msg.content)},
-        }
+        return {"role": "user", "content": _as_text(msg.content)}
     if isinstance(msg, AIMessage):
         serializable = _tool_calls_from_message(msg)
-        return {
-            **base,
-            "message": {
-                "role": "assistant",
-                "content": _as_text(msg.content),
-                "tool_calls": serializable,
-            },
+        payload: dict[str, Any] = {
+            "role": "assistant",
+            "content": _as_text(msg.content),
         }
+        if serializable:
+            payload["tool_calls"] = serializable
+        return payload
     if isinstance(msg, ToolMessage):
         return {
-            **base,
-            "message": {
-                "role": "tool",
-                "content": _as_text(msg.content),
-                "tool_call_id": getattr(msg, "tool_call_id", "") or "",
-            },
+            "role": "tool",
+            "content": _as_text(msg.content),
+            "tool_call_id": getattr(msg, "tool_call_id", "") or "",
         }
     if is_compaction_summary_message(msg):
         return {
-            **base,
-            "message": {
-                "role": "system",
-                "content": _as_text(msg.content),
-                "kind": COMPACTION_SUMMARY_KIND,
-            },
+            "role": "system",
+            "content": _as_text(msg.content),
+            "kind": COMPACTION_SUMMARY_KIND,
         }
     if isinstance(msg, SystemMessage):
         return None
-    return {**base, "message": {"role": "unknown", "content": str(msg)}}
+    return {"role": msg.__class__.__name__, "content": str(msg)}
+
+
+def _msg_to_record(msg: BaseMessage, run_id: str) -> dict[str, Any] | None:
+    """单条 BaseMessage → 写入 JSONL 的一条 dict（含同一 run 内共享的 run_id）。"""
+    payload = _message_payload(msg)
+    if payload is None:
+        return None
+    return {
+        "timestamp": time.time(),
+        "run_id": run_id,
+        "message": payload,
+    }
 
 
 def _record_to_message(rec: dict[str, Any]) -> BaseMessage | None:
@@ -172,7 +236,7 @@ def load_transcript_messages(session_id: str) -> list[BaseMessage]:
                     out.append(m)
     except (OSError, json.JSONDecodeError):
         return []
-    return out
+    return normalize_transcript_messages(out)
 
 
 def build_transcript_read_view(messages: list[BaseMessage]) -> str:
@@ -206,7 +270,10 @@ def messages_to_jsonl_lines(
     """
     rid = run_id.strip() or str(uuid.uuid4())
     lines: list[str] = []
-    for msg in messages[start_index:]:
+    normalized = normalize_transcript_messages(
+        [msg for msg in messages if isinstance(msg, BaseMessage)]
+    )
+    for msg in normalized[start_index:]:
         if not isinstance(msg, BaseMessage):
             continue
         rec = _msg_to_record(msg, rid)
@@ -231,40 +298,9 @@ def messages_to_export_dicts(messages: list[Any]) -> list[dict[str, Any]]:
     for msg in messages:
         if not isinstance(msg, BaseMessage):
             continue
-        if isinstance(msg, HumanMessage):
-            out.append({"role": "user", "content": _as_text(msg.content)})
-            continue
-        if isinstance(msg, AIMessage):
-            row: dict[str, Any] = {
-                "role": "assistant",
-                "content": _as_text(msg.content),
-            }
-            tc = _tool_calls_from_message(msg)
-            if tc:
-                row["tool_calls"] = tc
-            out.append(row)
-            continue
-        if isinstance(msg, ToolMessage):
-            out.append(
-                {
-                    "role": "tool",
-                    "content": _as_text(msg.content),
-                    "tool_call_id": getattr(msg, "tool_call_id", "") or "",
-                }
-            )
-            continue
-        if is_compaction_summary_message(msg):
-            out.append(
-                {
-                    "role": "system",
-                    "kind": COMPACTION_SUMMARY_KIND,
-                    "content": _as_text(msg.content),
-                }
-            )
-            continue
-        if isinstance(msg, SystemMessage):
-            continue
-        out.append({"role": msg.__class__.__name__, "content": str(msg)})
+        payload = _message_payload(msg)
+        if payload is not None:
+            out.append(payload)
     return out
 
 

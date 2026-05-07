@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from luckbot.core.observability import log_exception
+
 from .config import DEFAULT_MCP_CONFIG_PATH, read_mcp_config, refresh_policy
 from .loader import build_mcp_tools, close_mcp_client
 
@@ -17,50 +19,55 @@ class MCPToolRegistry:
     def __init__(self, config_path: str = DEFAULT_MCP_CONFIG_PATH) -> None:
         self._config_path = config_path
         self._config_mtime: float | None = None
+        self._cache_valid = False
         self._cached_tools: dict[str, Any] = {}
         self._clients: list[Any] = []
 
     async def get_tools(self) -> dict[str, Any]:
         snapshot = read_mcp_config(self._config_path)
         if not snapshot.exists:
-            await self.close()
-            self._config_mtime = None
-            return {}
+            return await self._clear(None)
 
         if snapshot.error is not None:
-            await self.close()
-            self._config_mtime = snapshot.mtime
-            logger.exception("读取 MCP 配置失败 %s", snapshot.path, exc_info=snapshot.error)
-            return {}
+            log_exception(
+                logger,
+                "mcp.config_read_failed",
+                snapshot.error,
+                path=snapshot.path,
+            )
+            return await self._clear(snapshot.mtime)
 
         if (
             refresh_policy() == "config"
             and snapshot.mtime == self._config_mtime
-            and self._cached_tools
+            and self._cache_valid
         ):
             return dict(self._cached_tools)
 
         if snapshot.servers is None:
-            await self.close()
-            self._config_mtime = snapshot.mtime
             logger.warning("MCP 配置缺少有效的「servers」对象")
-            return {}
+            return await self._clear(snapshot.mtime)
 
         if not snapshot.servers:
-            await self.close()
-            self._config_mtime = snapshot.mtime
             logger.warning("MCP 配置中的「servers」为空")
-            return {}
+            return await self._clear(snapshot.mtime)
 
         await self.close()
         build = await build_mcp_tools(snapshot.servers)
         self._cached_tools = build.tools
         self._clients = build.clients
         self._config_mtime = snapshot.mtime
+        self._cache_valid = True
         return dict(self._cached_tools)
 
     async def close(self) -> None:
         self._cached_tools.clear()
+        self._cache_valid = False
         for client in reversed(self._clients):
             await close_mcp_client(client)
         self._clients.clear()
+
+    async def _clear(self, mtime: float | None) -> dict[str, Any]:
+        await self.close()
+        self._config_mtime = mtime
+        return {}

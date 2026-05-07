@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from luckbot.domains.session.state import legacy_state_dir, resolve_state_dir
+from luckbot.domains.session.state import resolve_state_dir
 
 
 def test_resolve_state_dir_defaults_to_project_local_state(
@@ -18,7 +18,7 @@ def test_resolve_state_dir_defaults_to_project_local_state(
     assert resolved == (tmp_path / ".luckbot" / "state").resolve()
 
 
-def test_resolve_state_dir_seeds_project_state_from_legacy_home(
+def test_resolve_state_dir_does_not_seed_from_legacy_home(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -39,8 +39,5 @@ def test_resolve_state_dir_seeds_project_state_from_legacy_home(
     resolved = resolve_state_dir()
 
     assert resolved == (project_root / ".luckbot" / "state").resolve()
-    assert (resolved / "sessions" / "sessions.json").read_text(encoding="utf-8").strip() == (
-        '{"default":{"session_id":"sess_1"}}'
-    )
-    assert (resolved / "memory" / "local" / "MEMORY.md").read_text(encoding="utf-8") == "# legacy memory\n"
-    assert legacy_state_dir() == legacy_root.resolve()
+    assert not (resolved / "sessions" / "sessions.json").exists()
+    assert not (resolved / "memory" / "local" / "MEMORY.md").exists()

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from luckbot.domains.skills.prompt import build_skill_prompt
 from luckbot.domains.skills.registry import SkillRegistry
+from luckbot.domains.skills.state import SkillStateStore
 
 
 def _write_skill_with_docs(root: Path, name: str) -> None:
@@ -34,7 +36,7 @@ def _write_skill_with_docs(root: Path, name: str) -> None:
     )
 
 
-def test_skill_registry_uses_relative_doc_paths_and_unique_basename_fallback(
+def test_skill_registry_uses_exact_relative_doc_paths(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -51,16 +53,13 @@ def test_skill_registry_uses_relative_doc_paths_and_unique_basename_fallback(
         "refs/guide.md",
     ]
     assert reg.load_doc("demo", "docs/guide.md") == "# docs guide\n\nfrom docs\n"
-    assert reg.load_doc("demo", "usage.md") == "# usage\n\nfrom usage\n"
+    assert reg.load_doc("demo", "extra/usage.md") == "# usage\n\nfrom usage\n"
+    assert reg.load_doc("demo", "usage.md") is None
     assert reg.load_doc("demo", "guide.md") is None
 
-    ok, invalid = reg.validate_docs("demo", ["docs/guide.md", "usage.md"])
-    assert ok is True
-    assert invalid == []
+    assert reg.invalid_docs("demo", ["docs/guide.md", "extra/usage.md"]) == []
 
-    ok, invalid = reg.validate_docs("demo", ["guide.md"])
-    assert ok is False
-    assert invalid == ["guide.md"]
+    assert reg.invalid_docs("demo", ["guide.md"]) == ["guide.md"]
 
 
 def test_skill_registry_refresh_detects_doc_changes(
@@ -97,3 +96,39 @@ def test_skill_registry_discovers_project_skills_independent_of_cwd(
     skill = reg.resolve("project-demo")
     assert skill is not None
     assert skill.name == "project-demo"
+
+
+def test_skill_registry_does_not_scan_legacy_project_skill_dirs(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    _write_skill_with_docs(tmp_path / ".agents" / "skills", "legacy-demo")
+    monkeypatch.setenv("LUCKBOT_PROJECT_ROOT", str(tmp_path))
+    monkeypatch.delenv("LUCKBOT_SKILLS_DIR", raising=False)
+
+    reg = SkillRegistry()
+    assert reg.refresh_if_changed() is True
+    assert reg.all_skills() == []
+    assert reg.resolve("legacy-demo") is None
+
+
+def test_build_skill_prompt_uses_loaded_skills_and_exact_docs(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    skills_root = tmp_path / "skills"
+    _write_skill_with_docs(skills_root, "demo")
+    monkeypatch.setenv("LUCKBOT_SKILLS_DIR", str(skills_root))
+
+    reg = SkillRegistry()
+    assert reg.refresh_if_changed() is True
+    state = SkillStateStore()
+    state.mark_loaded("demo")
+    state.select_docs("demo", ["extra/usage.md"])
+
+    prompt = build_skill_prompt(reg, state.snapshot())
+
+    assert "registry test skill" in prompt
+    assert "--- 已加载技能: demo ---" in prompt
+    assert "--- 参考文档: demo/extra/usage.md ---" in prompt
+    assert "from usage" in prompt

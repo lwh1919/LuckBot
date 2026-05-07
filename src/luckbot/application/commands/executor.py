@@ -3,13 +3,9 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from luckbot.domains.mcp import DEFAULT_MCP_CONFIG_PATH, read_mcp_config
-from luckbot.domains.skills.registry import SkillRegistry
 from luckbot.domains.memory.paths import resolve_memory_paths
 from luckbot.domains.memory.session_memory import archive_last_session_to_markdown
-from luckbot.core.plugin.hooks import BeforeRunInput
 from luckbot.domains.session.transcript import messages_to_export_dicts
-from luckbot.application.prompt import SYSTEM_PROMPT
 
 from .parser import tokenize_command
 from .registry import render_help_text
@@ -29,7 +25,7 @@ async def execute_command(text: str, ctx: CommandContext) -> CommandResult:
     if tokenized.name == "help":
         return CommandResult(handled=True, final_text=render_help_text())
     if tokenized.name == "skill":
-        return await _execute_skill_command(tokenized)
+        return _execute_skill_command(tokenized, ctx)
     if tokenized.name == "mcp":
         return await _execute_mcp_command(tokenized, ctx)
     if tokenized.name == "plugin":
@@ -43,25 +39,33 @@ def _unknown_command_text(text: str) -> str:
     return f"未知命令: {text}\n输入 /help 查看可用命令。"
 
 
-async def _execute_skill_command(tokenized: TokenizedCommand) -> CommandResult:
-    reg = SkillRegistry()
-    reg.refresh_if_changed()
+def _execute_skill_command(
+    tokenized: TokenizedCommand,
+    ctx: CommandContext,
+) -> CommandResult:
+    registry = ctx.plugin_manager.get_service("skill_registry")
+    if registry is None:
+        return CommandResult(
+            handled=True,
+            final_text="未注册 skill_registry（SkillsPlugin 未加载？）",
+        )
+
     tokens = tokenized.tokens
     action = tokens[0].lower() if tokens else "list"
     if action == "list" and len(tokens) <= 1:
-        skills = sorted(reg.all_skills(), key=lambda item: item.name)
+        skills = sorted(registry.all_skills(), key=lambda item: item.name)
         if not skills:
             return CommandResult(
                 handled=True,
-                final_text="未发现 Skill（检查 .luckbot/skills 与 ~/.luckbot/skills）",
+                final_text="当前 SkillsPlugin 未发现 Skill。",
             )
-        lines = ["已扫描的 Skill:"]
+        lines = ["当前已装配的 Skill:"]
         for skill in skills:
             lines.append(f"- `{skill.name}`  {skill.description}")
         return CommandResult(handled=True, final_text="\n".join(lines))
 
     if action == "show" and len(tokens) == 2:
-        skill = reg.resolve(tokens[1])
+        skill = registry.resolve(tokens[1])
         if skill is None:
             return CommandResult(
                 handled=True,
@@ -97,8 +101,16 @@ async def _execute_mcp_command(
     if action != "list" or len(tokens) > 1:
         return CommandResult(handled=True, final_text="用法错误。\n`/mcp list`")
 
+    config_snapshot = ctx.plugin_manager.get_service("mcp_config_snapshot")
+    tool_names = ctx.plugin_manager.get_service("mcp_tool_names")
+    if not callable(config_snapshot) or not callable(tool_names):
+        return CommandResult(
+            handled=True,
+            final_text="未注册 MCP 查询服务（MCPPlugin 未加载？）",
+        )
+
     lines: list[str] = []
-    snapshot = read_mcp_config(DEFAULT_MCP_CONFIG_PATH)
+    snapshot = config_snapshot()
     if snapshot.exists:
         if snapshot.error is not None:
             return CommandResult(
@@ -118,21 +130,20 @@ async def _execute_mcp_command(
         else:
             lines.append("- 无 servers 条目")
     else:
-        lines.append(f"未找到 {DEFAULT_MCP_CONFIG_PATH}")
+        lines.append(f"未找到 {snapshot.path}")
 
     try:
-        tools = await _merged_tools_after_before_run(ctx)
+        names = await tool_names()
     except Exception as exc:  # pragma: no cover - exercised by tests via text only
-        return CommandResult(handled=True, final_text=f"合并 MCP 工具失败: {exc}")
+        return CommandResult(handled=True, final_text=f"加载 MCP 工具失败: {exc}")
 
-    mcp_names = sorted(name for name in tools if name.startswith("mcp_"))
     lines.append("")
-    lines.append("当前 before_run 合并后的 MCP 工具名:")
-    if mcp_names:
-        for name in mcp_names:
+    lines.append("当前 MCPPlugin 暴露的工具名:")
+    if names:
+        for name in names:
             lines.append(f"- {name}")
     else:
-        lines.append("- 无 mcp_ 前缀工具")
+        lines.append("- 无 MCP 工具")
     return CommandResult(handled=True, final_text="\n".join(lines))
 
 
@@ -278,28 +289,3 @@ def _execute_session_export(tokens: list[str], history: list[Any]) -> CommandRes
         handled=True,
         final_text=json.dumps(data, ensure_ascii=False, indent=2),
     )
-
-
-async def _merged_tools_after_before_run(ctx: CommandContext) -> dict[str, Any]:
-    current_tools = dict(ctx.plugin_manager.get_tools())
-    current_prompt = SYSTEM_PROMPT
-    conv_history = list(ctx.conversation_history)
-    for hook in ctx.plugin_manager.get_hooks("before_run"):
-        result = await hook(
-            BeforeRunInput(
-                tools=current_tools,
-                system_prompt=current_prompt,
-                conversation_history=conv_history,
-                session_key=ctx.session_key,
-                owner_id=ctx.owner_id,
-            )
-        )
-        if result is None:
-            continue
-        if result.tools is not None:
-            current_tools = result.tools
-        if result.system_prompt is not None:
-            current_prompt = result.system_prompt
-        if result.conversation_history is not None:
-            conv_history = list(result.conversation_history)
-    return current_tools

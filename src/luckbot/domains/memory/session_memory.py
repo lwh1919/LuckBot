@@ -208,6 +208,31 @@ def _render_archive_markdown(
     return "\n".join(body)
 
 
+def _session_archive_prefix(session_id: str) -> str:
+    normalized = _slugify(session_id)
+    if normalized:
+        return normalized[:12].strip("-") or "session"
+    return hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:12]
+
+
+def _unique_archive_rel_path(
+    *,
+    day: str,
+    session_id: str,
+    slug: str,
+    paths: MemoryPaths,
+) -> str:
+    base = f"memory/sessions/{day}/{_session_archive_prefix(session_id)}-{slug}"
+    for suffix in ["", *[f"-{index}" for index in range(2, 1000)]]:
+        rel_path = f"{base}{suffix}.md"
+        dst = resolve_memory_write_path(rel_path, paths)
+        if dst is None:
+            raise RuntimeError(f"归档路径非法: {rel_path}")
+        if not dst.exists():
+            return rel_path
+    raise RuntimeError("无法生成唯一归档路径")
+
+
 async def archive_last_session_to_markdown(
     session_key: str,
     paths: MemoryPaths,
@@ -215,14 +240,14 @@ async def archive_last_session_to_markdown(
     *,
     session_id: str | None = None,
 ) -> str | None:
-    """将当前活动会话归档到 memory/YYYY-MM-DD-{slug}.md。"""
+    """将当前活动会话归档到唯一的 memory/sessions/YYYY-MM-DD/*.md。"""
     ensure_memory_tree(paths)
     limit = env_int("LUCKBOT_SESSION_MEMORY_LAST_N", 15)
+    active_session_id = session_id or resolve_session(session_key).session_id
 
     if messages:
         base_messages = [m for m in messages if isinstance(m, BaseMessage)]
     elif _archive_enabled():
-        active_session_id = session_id or resolve_session(session_key).session_id
         base_messages = load_transcript_messages(active_session_id)
     else:
         base_messages = []
@@ -239,7 +264,12 @@ async def archive_last_session_to_markdown(
         excerpt=excerpt[:14000],
         day=day,
     )
-    rel_path = f"memory/{day}-{payload.slug}.md"
+    rel_path = _unique_archive_rel_path(
+        day=day,
+        session_id=active_session_id,
+        slug=payload.slug,
+        paths=paths,
+    )
     dst = resolve_memory_write_path(rel_path, paths)
     if dst is None:
         raise RuntimeError(f"归档路径非法: {rel_path}")

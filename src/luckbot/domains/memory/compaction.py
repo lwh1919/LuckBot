@@ -21,13 +21,20 @@ import os
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
 from luckbot.core.config.env_parse import env_int
 from luckbot.core.llm.client import build_llm
-from luckbot.core.observability import add_event, record_exception, start_langsmith_run, start_span
+from luckbot.core.observability import (
+    add_event,
+    log_exception,
+    record_exception,
+    start_langsmith_run,
+    start_span,
+)
 from luckbot.core.plugin.hooks import BeforeLLMCallInput, BeforeLLMCallResult
 from luckbot.domains.session.message_types import build_compaction_summary_message
+from luckbot.domains.session.transcript import normalize_transcript_messages
 
 from .flush_agent import run_memory_flush_agent
 from .flush_context import memory_flush_nested
@@ -63,10 +70,34 @@ def _estimate_tokens(messages: list[Any]) -> int:
 def _keep_recent_messages(
     messages: list[BaseMessage], keep: int
 ) -> list[BaseMessage]:
-    """保留列表尾部 K 条（通常含最近 user/assistant，避免摘要后丢失当前话题）。"""
-    if keep <= 0 or len(messages) <= keep:
-        return list(messages)
-    return list(messages[-keep:])
+    """保留尾部消息，同时保持 AI tool_calls 与 ToolMessage 的完整配对。"""
+    valid_messages = normalize_transcript_messages(messages)
+    if keep <= 0 or len(valid_messages) <= keep:
+        return valid_messages
+
+    groups: list[list[BaseMessage]] = []
+    i = 0
+    n = len(valid_messages)
+    while i < n:
+        msg = valid_messages[i]
+        if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
+            group = [msg]
+            j = i + 1
+            while j < n and isinstance(valid_messages[j], ToolMessage):
+                group.append(valid_messages[j])
+                j += 1
+            groups.append(group)
+            i = j
+            continue
+        groups.append([msg])
+        i += 1
+
+    kept: list[BaseMessage] = []
+    for group in reversed(groups):
+        kept = [*group, *kept]
+        if len(kept) >= keep:
+            break
+    return kept
 
 
 def _flush_transcript_excerpt(messages: list[Any]) -> str:
@@ -152,9 +183,9 @@ async def maybe_compact_before_llm(
                         max_steps=max_steps,
                         day=day,
                     )
-            except Exception as e:
-                logger.warning("Memory flush agent 失败: %s", e)
-                record_exception(e)
+            except Exception as exc:
+                log_exception(logger, "memory.flush_agent_failed", exc)
+                record_exception(exc)
             finally:
                 memory_flush_nested.reset(tok)
 
@@ -193,7 +224,7 @@ async def maybe_compact_before_llm(
             attributes={"kept_messages": len(trimmed), "summary_chars": len(summary.strip())},
         )
         return BeforeLLMCallResult(messages=new_chain)
-    except Exception as e:
-        logger.warning("摘要压缩失败，仅截断: %s", e)
-        record_exception(e)
+    except Exception as exc:
+        log_exception(logger, "memory.compaction_summary_failed", exc)
+        record_exception(exc)
         return BeforeLLMCallResult(messages=trimmed)

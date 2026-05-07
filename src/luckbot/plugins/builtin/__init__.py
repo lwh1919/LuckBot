@@ -15,6 +15,7 @@ import importlib
 import logging
 import os
 
+from luckbot.core.observability import log_exception
 from luckbot.core.plugin.manager import _find_plugin_class
 
 logger = logging.getLogger(__name__)
@@ -39,8 +40,8 @@ def discover_builtin_plugins():
 
         try:
             mod = importlib.import_module(f"luckbot.plugins.builtin.{name}")
-        except Exception:
-            logger.exception("导入内置插件包 %s 失败", name)
+        except Exception as exc:
+            log_exception(logger, "plugin.import_builtin_failed", exc, plugin_package=name)
             continue
 
         plugin_cls = _find_plugin_class(mod)
@@ -50,8 +51,7 @@ def discover_builtin_plugins():
 
         try:
             plugins.append(plugin_cls())
-            logger.info("已发现内置插件: %s", name)
-        except Exception:
-            logger.exception("实例化内置插件 %s 失败", name)
+        except Exception as exc:
+            log_exception(logger, "plugin.instantiate_builtin_failed", exc, plugin_package=name)
 
     return plugins

@@ -12,7 +12,8 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from luckbot.domains.skills.types import RemoteSkillRequest
+    from luckbot.domains.skills.types import SkillActivationRequest
+    from luckbot.core.runtime.types import RuntimeContext
 
 
 # ---------------------------------------------------------------------------
@@ -21,27 +22,31 @@ if TYPE_CHECKING:
 
 @dataclass
 class BeforeRunInput:
+    runtime_context: RuntimeContext
     tools: dict[str, Any]
     system_prompt: str
-    """截至上一轮的多轮对话消息（LangChain BaseMessage），不含本轮 ``user_input``。"""
-    conversation_history: list[Any] = field(default_factory=list)
+    """本次 run 的完整输入消息链（LangChain BaseMessage）。"""
+    messages: list[Any] = field(default_factory=list)
     session_key: str | None = None
     owner_id: str | None = None
     trace_id: str | None = None
     run_id: str | None = None
-    remote_skill: RemoteSkillRequest | None = None
+    requested_skill: SkillActivationRequest | None = None
 
 
 @dataclass
 class BeforeRunResult:
     tools: dict[str, Any] | None = None
     system_prompt: str | None = None
-    """若非 ``None``，则用其整体替换 ``conversation_history``（例如从磁盘加载）。"""
-    conversation_history: list[Any] | None = None
+    """若非 ``None``，则用其整体替换本次 run 的输入消息链。"""
+    messages: list[Any] | None = None
+    session_key: str | None = None
+    owner_id: str | None = None
 
 
 @dataclass
 class AfterRunInput:
+    runtime_context: RuntimeContext
     result: str
     messages: list[Any]
     session_key: str | None = None
@@ -57,6 +62,7 @@ class AfterRunInput:
 
 @dataclass
 class BeforeLLMCallInput:
+    runtime_context: RuntimeContext
     tools: dict[str, Any]
     system_prompt: str
     messages: list[Any]
@@ -76,6 +82,7 @@ class BeforeLLMCallResult:
 
 @dataclass
 class AfterLLMCallInput:
+    runtime_context: RuntimeContext
     response: Any
     usage: dict[str, Any] | None = None
     trace_id: str | None = None
@@ -88,6 +95,7 @@ class AfterLLMCallInput:
 
 @dataclass
 class BeforeToolCallInput:
+    runtime_context: RuntimeContext
     name: str
     args: dict[str, Any]
     tool_call_id: str = ""
@@ -103,6 +111,7 @@ class BeforeToolCallResult:
 
 @dataclass
 class AfterToolCallInput:
+    runtime_context: RuntimeContext
     name: str
     args: dict[str, Any]
     output: str

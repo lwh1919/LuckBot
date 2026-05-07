@@ -169,8 +169,6 @@ async def hybrid_search(
                     vector_scores[cid] = 1.0
                 else:
                     vector_scores[cid] = 1.0 - (float(dist) - dlo) / (dhi - dlo)
-        else:
-            index.vec_enabled and logger.debug("vec KNN 无结果，尝试 Python 余弦")
 
     if qvec and (not vector_scores or not index.vec_enabled):
         cands = list(meta.keys())

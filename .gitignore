@@ -22,9 +22,29 @@ build/
 .pytest_cache/
 .coverage
 htmlcov/
+tests/__pycache__/
+tests/.pytest_cache/
+tests/.artifacts/
+tests/tmp/
+tests/output/
+
+# ── Python 工具缓存 ─────────────────────────────────────────────────────────
+.ruff_cache/
+.mypy_cache/
+.pyre/
 
 # ── 日志 ─────────────────────────────────────────────────────────────────────
 *.log
+
+# ── 本地数据库 / 密钥材料 ────────────────────────────────────────────────────
+*.sqlite
+*.sqlite3
+*.db
+*.pem
+*.key
+*.p12
+*.crt
+*.csr
 
 # ── macOS ────────────────────────────────────────────────────────────────────
 .DS_Store
@@ -46,3 +66,9 @@ Desktop.ini
 # ── LuckBot 本地运行产物 / 配置（保留目录名）────────────────────────────────
 .luckbot/*
 !.luckbot/
+
+# ── mydocs 本地任务过程（保留模板与项目真相文档）────────────────────────────
+mydocs/specs/*.md
+!mydocs/specs/_template.md
+mydocs/micro_specs/*.md
+!mydocs/micro_specs/_template.md

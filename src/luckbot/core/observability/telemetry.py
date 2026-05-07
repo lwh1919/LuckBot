@@ -161,7 +161,7 @@ def add_event(name: str, *, attributes: dict[str, Any] | None = None) -> None:
     try:
         span.add_event(name, attributes=attributes or {})
     except Exception:
-        logger.debug("span.add_event 失败", exc_info=True)
+        return
 
 
 def record_exception(exc: Exception) -> None:
@@ -173,7 +173,7 @@ def record_exception(exc: Exception) -> None:
     try:
         span.record_exception(exc)
     except Exception:
-        logger.debug("span.record_exception 失败", exc_info=True)
+        return
 
 
 def _meter() -> Any | None:
@@ -215,12 +215,35 @@ def log_event(
     event: str,
     **fields: Any,
 ) -> None:
+    logger_obj.log(level, json.dumps(_log_payload(event, **fields), ensure_ascii=False, default=str))
+
+
+def log_exception(
+    logger_obj: logging.Logger,
+    event: str,
+    exc: Exception,
+    **fields: Any,
+) -> None:
+    """记录结构化异常日志，并保留 Python traceback。"""
+    payload = _log_payload(
+        event,
+        error_type=exc.__class__.__name__,
+        error=str(exc),
+        **fields,
+    )
+    logger_obj.error(
+        json.dumps(payload, ensure_ascii=False, default=str),
+        exc_info=(type(exc), exc, exc.__traceback__),
+    )
+
+
+def _log_payload(event: str, **fields: Any) -> dict[str, Any]:
     ctx = current_observability_context()
     payload: dict[str, Any] = {"event": event}
     if ctx is not None:
         payload.update(ctx.as_metadata())
     payload.update({key: value for key, value in fields.items() if value is not None})
-    logger_obj.log(level, json.dumps(payload, ensure_ascii=False, default=str))
+    return payload
 
 
 __all__ = [
@@ -229,6 +252,7 @@ __all__ = [
     "increment_counter",
     "init_observability",
     "log_event",
+    "log_exception",
     "record_exception",
     "record_histogram",
     "start_span",

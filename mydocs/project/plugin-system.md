@@ -8,7 +8,7 @@
 
 - 插件系统负责装配工具、hook 与 service，不承载具体业务语义
 - `memory`、`session`、`skills`、`mcp`、`tools` 等运行时能力当前都通过插件接入
-- agent loop 负责调用插件 hook，插件系统本身不执行 LLM 推理
+- runtime 负责调用插件 hook，插件系统本身不执行 LLM 推理
 
 ## 模块职责
 
@@ -20,7 +20,7 @@ LuckBot 当前的插件系统负责：
 - 按依赖关系对插件做拓扑排序
 - 初始化并销毁插件实例
 - 为运行时暴露 `tools`、`hooks`、`services`
-- 让 `agent_loop` 与子任务 loop 按统一顺序调用插件 hook
+- 让不同 runtime run 按统一顺序调用插件 hook
 
 ## 当前真实行为
 
@@ -56,7 +56,7 @@ LuckBot 当前的插件系统负责：
 
 - `register_tool(name, tool)`
 - `get_tools()`
-- `register_hook(hook_name, handler)`
+- `register_hook(hook_name, handler, priority=1000)`
 - `get_hooks(hook_name)`
 - `register_service(name, service)`
 - `get_service(name)`
@@ -66,6 +66,8 @@ LuckBot 当前的插件系统负责：
 - 工具名重复时不会报错
 - 会记录 warning
 - 后注册的工具覆盖前面的同名工具
+- 工具能力应在插件 `initialize()` 阶段注册
+- hook 可在运行时改写本轮工具表，但不应作为工具能力出现的唯一入口
 
 当前 service 注册语义也是：
 
@@ -76,7 +78,11 @@ LuckBot 当前的插件系统负责：
 
 - hook 名必须属于 `VALID_HOOK_NAMES`
 - 非法名称直接抛 `ValueError`
-- 合法 hook 按注册顺序 `append` 到列表
+- 合法 hook 会记录 `priority`、注册顺序与 handler
+- 默认 `priority` 是 `1000`
+- `get_hooks()` 返回时按 `(priority, 注册顺序)` 排序
+- `priority` 数值越小越早执行
+- 同 priority 保持注册顺序
 - 不做去重与覆盖
 
 `get_tools()` 当前返回字典副本，`get_hooks()` 返回列表副本。
@@ -87,6 +93,25 @@ LuckBot 当前的插件系统负责：
 - 但不会直接拿到 `PluginContext` 内部容器引用
 
 `get_service()` 当前直接返回注册对象本身，不做复制。
+
+当前 dependencies、hook priority 与 service 的边界是：
+
+- `dependencies`
+  - 表达插件初始化顺序与整体能力依赖
+  - 例如某插件需要另一个插件先注册 service
+- `hook priority`
+  - 只表达同一 hook 名下的执行顺序
+  - 不表达业务调用关系
+- `service`
+  - 表达插件之间的显式业务能力调用
+  - 例如一个插件在收尾时主动调用另一个插件注册的同步能力
+
+因此当前规则是：
+
+- 先按 `dependencies` 初始化插件
+- 插件初始化时注册 hook
+- runtime 执行同名 hook 时再按 `priority` 与注册顺序排序
+- 不用 priority 隐式表达应该写成 service 的业务调用
 
 ### 3. 当前只有六类合法 hook
 
@@ -104,11 +129,11 @@ LuckBot 当前的插件系统负责：
 当前语义是：
 
 - `before_run`
-  - 面向单次 `agent_loop()` 调用
+  - 面向单次 runtime run
   - 可改写 `tools`
   - 可改写 `system_prompt`
-  - 可整体替换 `conversation_history`
-  - 还能收到 `remote_skill`
+  - 可整体替换 `messages`
+  - 还能收到 `requested_skill`
 - `after_run`
   - 面向单次 run 结束
   - 能拿到最终文本与完整消息链
@@ -210,34 +235,36 @@ LuckBot 当前的插件系统负责：
 
 - 插件类属性 `dependencies`
 
-例如当前 `RemoteSkillPlugin.dependencies = ["luckbot/built-in-skills"]`，所以它会在 `SkillsPlugin` 之后初始化。
+例如当前 `SkillActivationPlugin.dependencies = ["luckbot/built-in-skills"]`，所以它会在 `SkillsPlugin` 之后初始化。
 
-### 7. 当前 `agent_loop` 负责按顺序执行插件 hook
+### 7. 当前 runtime 负责按顺序执行插件 hook
 
-插件系统本身只负责注册和暴露 hook，真正的调用顺序在 `src/luckbot/core/runtime/agent_loop.py`。
+插件系统本身只负责注册和暴露 hook，真正的调用顺序在 `src/luckbot/core/runtime/core.py` 与 `src/luckbot/core/runtime/react_loop.py`。
 
-`agent_loop()` 当前真实顺序是：
+一次 runtime run 当前真实顺序是：
 
 1. 取 `plugin_manager.get_tools()` 作为初始工具表
-2. 处理内联 remote skill 指令并得到 `effective_remote_skill`
+2. 从 `RuntimeContext.messages` 复制出本次输入消息链
 3. 依次执行所有 `before_run` hook
-4. 把当前用户消息追加到 `messages`
-5. 进入 `run_react_loop()`
-6. run 结束后依次执行所有 `after_run` hook
+4. 进入 `run_react_loop()`
+5. run 结束后依次执行所有 `after_run` hook
 
 `before_run` 的联动语义是：
 
 - 前一个 hook 改写后的 `tools`
 - `system_prompt`
-- `conversation_history`
+- `messages`
+- `session_key`
+- `owner_id`
 
 会作为后一个 hook 的输入继续向下传递。
+所有 hook input 当前都携带同一个 `runtime_context`，供插件读取 run 级身份与当前运行态。
 
 ### 8. 当前 ReAct 内循环继续复用插件系统
 
 `run_react_loop()` 当前每轮都会：
 
-1. 从固定 `tools` 和 `system_prompt` 启动本轮快照
+1. 从 `RuntimeContext.current_tools/current_prompt` 启动本轮快照
 2. 依次执行所有 `before_llm_call`
 3. 用改写后的 prompt 与工具表调用 LLM
 4. 依次执行所有 `after_llm_call`
@@ -252,31 +279,31 @@ LuckBot 当前的插件系统负责：
 
 当前工具调用是并发的，但单个工具调用内部的 hook 仍按顺序串行执行。
 
-### 9. 当前插件系统不只服务主对话，也服务子任务 loop
+### 9. 当前插件系统不只服务主对话，也服务独立 runtime run
 
 插件系统不是只给 CLI 主会话用。
 
-`src/luckbot/core/runtime/core.py` 当前统一承载主 agent 与受限运行时的插件装配语义。
+`src/luckbot/core/runtime/core.py` 当前统一承载所有 agent run 的插件装配语义。
 
-当前子任务链路是：
+当前独立 runtime run 链路是：
 
 - `run_runtime()`
   - 若未传外部 `PluginManager`，则创建新的 `PluginManager`
   - 初始化显式传入的 runtime plugins
-  - 若给了轻量 providers，再通过内部 runtime plugin 把 tools / services 注册到同一个 context
   - 调 `run_react_loop()`
   - 若 manager 由 runtime 持有，则在结束后销毁
-- `run_subagent()`
-  - 作为受限 profile 适配层，构造 subagent spec 后再调 `run_runtime()`
 - `run_memory_flush_agent()`
   - 作为 memory 领域适配层，构造 memory flush 专用 plugins、prompt 与 messages
-  - 再调用 `run_subagent()`
+  - 构造 `RuntimeContext` 后直接调用 `run_runtime()`
+
+独立 runtime run 的私有工具与 service 当前也应通过插件注册。
+`MemoryFlushToolsPlugin` 是当前代码中的 plugin-first 示例：它只注册 flush 白名单工具，不引入额外 provider 抽象。
 
 这说明当前插件系统的边界是：
 
 - 它是一个通用运行时装配层
-- 主 agent 与受限运行时都可以各自持有独立的 `PluginManager`
-- 主 agent / subagent 语义本身不属于 `PluginManager`，而属于其上的 runtime 组装层
+- 不同 runtime run 都可以各自持有独立的 `PluginManager`
+- 主 agent / 子 agent 语义本身不属于 `PluginManager`，运行差异由 `RuntimeContext` / `RuntimeProfile` 表达
 
 ### 10. 当前 CLI 是插件系统的主要装配入口
 
@@ -298,7 +325,9 @@ LuckBot 当前的插件系统负责：
 - `/plugin`
   - 通过 `pm.list_plugins()` 展示已加载插件
 - `/mcp list`
-  - 通过执行与标准 run 同顺序的 `before_run` 合并，观察 MCP 工具
+  - 通过 `mcp_config_snapshot` / `mcp_tool_names` service 观察 MCP 配置与工具
+- `/skill list` / `/skill show`
+  - 通过 `skill_registry` service 展示当前已装配 skill
 - `/session save`
   - 通过 `pm.get_service("session_flush")` 调用 session 插件能力
 
@@ -324,7 +353,8 @@ LuckBot 当前的插件系统负责：
 
 - `core/plugin/base.py`
 - `core/plugin/manager.py`
-- `core/runtime/agent_loop.py`
+- `core/runtime/core.py`
+- `core/runtime/react_loop.py`
 
 ## 关键入口
 
@@ -352,12 +382,11 @@ LuckBot 当前的插件系统负责：
   - `_find_plugin_class`
 - `src/luckbot/plugins/builtin/__init__.py`
   - `discover_builtin_plugins`
-- `src/luckbot/core/runtime/agent_loop.py`
-  - `agent_loop`
+- `src/luckbot/core/runtime/core.py`
+  - `run_runtime`
+- `src/luckbot/core/runtime/react_loop.py`
   - `run_react_loop`
   - `_run_one_tool`
-- `src/luckbot/core/subagent/runtime.py`
-  - `run_subagent`
 - `src/luckbot/domains/memory/flush_agent.py`
   - `MemoryFlushToolsPlugin`
   - `run_memory_flush_agent`
@@ -366,7 +395,7 @@ LuckBot 当前的插件系统负责：
 
 - 插件系统负责装配、依赖排序、注册表与 hook 暴露
 - 插件系统不负责 memory、session、skills、mcp 等模块自身的业务语义
-- hook 的真实执行时机定义在 `agent_loop` / `run_react_loop`，不在 `PluginManager`
+- hook 的真实执行时机定义在 `run_runtime` / `run_react_loop`，不在 `PluginManager`
 - 外部插件能接入 LuckBot，但必须遵守 `*_plugin/` 包结构和 `LuckbotPlugin` 契约
 - service 是插件间与 CLI 的共享能力入口，不是对模型暴露的 tool
 
@@ -377,3 +406,4 @@ LuckBot 当前的插件系统负责：
 - 插件名冲突当前没有显式拒绝；依赖排序按 `plugin.name` 建图，重名插件会产生不直观结果
 - 若某个插件自身没有正确实现“destroy 后可再次 initialize”的内部状态收敛，同一个 manager 实例虽可复用，仍可能暴露插件级状态残留问题
 - hook 按注册顺序串行生效，跨插件改写 `tools`、`prompt`、`messages` 时容易出现顺序耦合
+- hook priority 已支持显式排序，但如果滥用 priority 表达业务依赖，仍会造成隐式耦合

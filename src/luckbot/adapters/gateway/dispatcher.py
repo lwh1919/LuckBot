@@ -5,19 +5,29 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from typing import Any
 
 from luckbot.core.observability import (
     ensure_observability_context,
     increment_counter,
-    log_event,
+    log_exception,
     record_exception,
     record_histogram,
     start_span,
     use_observability_context,
 )
-from luckbot.adapters.gateway.types import GatewayRunner, IncomingEnvelope, PlatformAdapter
+from luckbot.adapters.gateway.types import GatewayRunner, PlatformAdapter
+from luckbot.application.turns import IncomingTurn, TurnResult
 
 logger = logging.getLogger(__name__)
+
+
+def _gateway_identity_attributes(incoming: IncomingTurn) -> dict[str, object]:
+    data = {
+        "luckbot.session_key": incoming.session_key,
+        "luckbot.owner_id": incoming.owner_id,
+    }
+    return {key: value for key, value in data.items() if value not in (None, "")}
 
 
 class SessionBusyError(RuntimeError):
@@ -30,16 +40,14 @@ class GatewayDispatcher:
     def __init__(self, adapter: PlatformAdapter, runner: GatewayRunner) -> None:
         self._adapter = adapter
         self._runner = runner
-        self._active_runs: dict[str, asyncio.Task[None]] = {}
+        self._active_runs: dict[str, asyncio.Task[Any]] = {}
         self._lock = asyncio.Lock()
 
-    async def enqueue(self, incoming: IncomingEnvelope) -> bool:
+    async def enqueue(self, incoming: IncomingTurn) -> bool:
         """提交任务；同一 session 已在执行时返回 False。"""
         obs_ctx = ensure_observability_context(
             trace_id=incoming.trace_id,
-            session_key=incoming.session_key,
-            owner_id=incoming.owner_id,
-            platform=incoming.platform,
+            platform=incoming.channel,
             gateway_message_id=incoming.message_id,
             gateway_trace_id=incoming.trace_id,
             chat_id=incoming.chat_id,
@@ -48,6 +56,7 @@ class GatewayDispatcher:
         with use_observability_context(obs_ctx):
             attrs = {
                 **obs_ctx.as_attributes(),
+                **_gateway_identity_attributes(incoming),
                 "gateway.adapter": self._adapter.name,
             }
             with start_span("gateway.enqueue", attributes=attrs):
@@ -57,13 +66,11 @@ class GatewayDispatcher:
                     return False
                 return True
 
-    async def run_inline(self, incoming: IncomingEnvelope) -> GatewayRunResult:
+    async def run_inline(self, incoming: IncomingTurn) -> TurnResult:
         """同步执行一次 gateway turn，并复用同会话并发保护。"""
         obs_ctx = ensure_observability_context(
             trace_id=incoming.trace_id,
-            session_key=incoming.session_key,
-            owner_id=incoming.owner_id,
-            platform=incoming.platform,
+            platform=incoming.channel,
             gateway_message_id=incoming.message_id,
             gateway_trace_id=incoming.trace_id,
             chat_id=incoming.chat_id,
@@ -72,6 +79,7 @@ class GatewayDispatcher:
         with use_observability_context(obs_ctx):
             attrs = {
                 **obs_ctx.as_attributes(),
+                **_gateway_identity_attributes(incoming),
                 "gateway.adapter": self._adapter.name,
             }
             async with self._lock:
@@ -90,12 +98,10 @@ class GatewayDispatcher:
             finally:
                 self._drop_active_run(incoming.session_key, task)
 
-    async def _run(self, incoming: IncomingEnvelope) -> None:
+    async def _run(self, incoming: IncomingTurn) -> None:
         obs_ctx = ensure_observability_context(
             trace_id=incoming.trace_id,
-            session_key=incoming.session_key,
-            owner_id=incoming.owner_id,
-            platform=incoming.platform,
+            platform=incoming.channel,
             gateway_message_id=incoming.message_id,
             gateway_trace_id=incoming.trace_id,
             chat_id=incoming.chat_id,
@@ -104,6 +110,7 @@ class GatewayDispatcher:
         with use_observability_context(obs_ctx):
             attrs = {
                 **obs_ctx.as_attributes(),
+                **_gateway_identity_attributes(incoming),
                 "gateway.adapter": self._adapter.name,
             }
             responder = await self._adapter.create_responder(incoming)
@@ -111,7 +118,7 @@ class GatewayDispatcher:
 
     async def _claim_background(
         self,
-        incoming: IncomingEnvelope,
+        incoming: IncomingTurn,
         attrs: dict[str, object],
     ) -> bool:
         async with self._lock:
@@ -133,16 +140,14 @@ class GatewayDispatcher:
 
     async def _execute_turn(
         self,
-        incoming: IncomingEnvelope,
+        incoming: IncomingTurn,
         attrs: dict[str, object],
         *,
         responder=None,
-    ) -> GatewayRunResult:
+    ) -> TurnResult:
         obs_ctx = ensure_observability_context(
             trace_id=incoming.trace_id,
-            session_key=incoming.session_key,
-            owner_id=incoming.owner_id,
-            platform=incoming.platform,
+            platform=incoming.channel,
             gateway_message_id=incoming.message_id,
             gateway_trace_id=incoming.trace_id,
             chat_id=incoming.chat_id,
@@ -150,7 +155,6 @@ class GatewayDispatcher:
         )
         with use_observability_context(obs_ctx):
             with start_span("gateway.run", attributes=attrs):
-                log_event(logger, logging.INFO, "gateway.run.start")
                 started_at = time.monotonic()
                 if responder is not None:
                     await responder.send_progress("LuckBot 正在处理中...")
@@ -167,7 +171,13 @@ class GatewayDispatcher:
                         time.monotonic() - started_at,
                         attributes={**attrs, "outcome": "error"},
                     )
-                    logger.exception("gateway run 失败: session=%s", incoming.session_key)
+                    log_exception(
+                        logger,
+                        "gateway.run_failed",
+                        exc,
+                        session_key=incoming.session_key,
+                        owner_id=incoming.owner_id,
+                    )
                     if responder is not None:
                         await responder.send_error(str(exc) or exc.__class__.__name__)
                     raise
@@ -181,7 +191,7 @@ class GatewayDispatcher:
                     await responder.send_final(result.final_text or "任务已完成，但未返回正文。")
                 return result
 
-    def _drop_active_run(self, session_key: str, task: asyncio.Task[None]) -> None:
+    def _drop_active_run(self, session_key: str, task: asyncio.Task[Any]) -> None:
         current = self._active_runs.get(session_key)
         if current is task:
             self._active_runs.pop(session_key, None)
@@ -191,4 +201,9 @@ class GatewayDispatcher:
             task.result()
         except Exception as exc:
             record_exception(exc)
-            logger.exception("gateway 后台任务异常: session=%s", session_key)
+            log_exception(
+                logger,
+                "gateway.background_task_failed",
+                exc,
+                session_key=session_key,
+            )

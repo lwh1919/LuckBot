@@ -5,8 +5,6 @@
 """
 
 from __future__ import annotations
-
-import logging
 from typing import Any
 
 from luckbot.core.plugin.base import LuckbotPlugin, PluginContext
@@ -20,8 +18,6 @@ from .grep import build_grep_tool
 from .ls import build_ls_tool
 from .sandbox_run import build_sandbox_run_tool
 from .safety import SafetyConfig
-
-logger = logging.getLogger(__name__)
 
 
 class ToolsPlugin(LuckbotPlugin):
@@ -43,13 +39,6 @@ class ToolsPlugin(LuckbotPlugin):
         ctx.register_tool("ls", build_ls_tool())
 
         ctx.register_hook("before_tool_call", self._safety_hook)
-
-        logger.info(
-            "ToolsPlugin 已注册 7 个基础工具 "
-            "(bash_timeout=%ds, sandbox_timeout=%ds)",
-            self._safety.bash_timeout,
-            self._safety.sandbox_timeout,
-        )
 
     async def _safety_hook(
         self, inp: BeforeToolCallInput

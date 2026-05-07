@@ -8,7 +8,7 @@
 
 - skill 的发现与解析
 - skill prompt 注入与运行态状态
-- remote skill 预加载
+- skill activation 预加载
 - 项目级 / 用户级目录语义
 
 ## 模块职责
@@ -20,16 +20,16 @@
 - 在单次 run 内维护已加载 skill / 已选文档状态
 - 在 `before_llm_call` 向 system prompt 注入 skill 信息
 - 暴露 `skill_load`、`skill_select_docs`、`skill_get_doc`、`skill_run`
-- 支持 inline remote skill directive
+- 支持 inline skill activation directive
 
 ## 当前真实行为
 
-### 1. 由 `SkillsPlugin` 与 `RemoteSkillPlugin` 共同组成
+### 1. 由 `SkillsPlugin` 与 `SkillActivationPlugin` 共同组成
 
 真实入口位于：
 
 - `src/luckbot/plugins/builtin/skills_plugin/__init__.py`
-- `src/luckbot/plugins/builtin/remote_skill_plugin/__init__.py`
+- `src/luckbot/plugins/builtin/skill_activation_plugin/__init__.py`
 
 `SkillsPlugin` 负责：
 
@@ -38,9 +38,9 @@
 - `before_run`
 - `before_llm_call`
 
-`RemoteSkillPlugin` 只负责：
+`SkillActivationPlugin` 只负责：
 
-- 读取单次 run 的 remote skill 请求
+- 读取单次 run 的 skill activation 请求
 - 在 `before_run` 中写入 `SkillStateStore`
 
 ### 2. skill 发现当前是“项目级优先，用户级兜底”
@@ -52,15 +52,8 @@
 当前默认扫描顺序是：
 
 1. `<project>/.luckbot/skills`
-2. `<project>/.agents/skills`
-3. `<project>/.pulse-coder/skills`
-4. `<project>/.coder/skills`
-5. `<project>/.claude/skills`
-6. `~/.luckbot/skills`
-7. `~/.pulse-coder/skills`
-8. `~/.coder/skills`
-9. `~/.claude/skills`
-10. `LUCKBOT_SKILLS_DIR` 追加的路径
+2. `~/.luckbot/skills`
+3. `LUCKBOT_SKILLS_DIR` 追加的路径
 
 其中项目级相对路径当前按项目根解析，不依赖当前 shell 的 `cwd`。
 
@@ -89,7 +82,7 @@
 - `docs/guide.md`
 - `refs/usage.md`
 
-basename 仅在唯一命中时作为兼容入口。
+文档引用必须使用这个相对路径精确匹配；basename 不再作为兼容入口。
 
 ### 5. skill 状态当前只在单次 run 内生效
 
@@ -103,11 +96,11 @@ basename 仅在唯一命中时作为兼容入口。
 
 - `skill_load` 不会跨下一轮输入保留
 - `skill_select_docs` 也不会跨 run 保留
-- remote skill 预加载同样是单次 run 语义
+- skill activation 预加载同样是单次 run 语义
 
 ### 6. prompt 注入仍采用 L0 / L1 / L2 三层
 
-`SkillsPlugin._before_llm_call()` 当前会在每次模型调用前重建 skill 注入块：
+`src/luckbot/domains/skills/prompt.py` 当前会在每次模型调用前重建 skill 注入块：
 
 - `L0`
   - 所有已扫描 skill 的概览
@@ -117,6 +110,7 @@ basename 仅在唯一命中时作为兼容入口。
   - 已选文档的完整正文
 
 当前注入发生在每轮 ReAct 迭代前，而不是启动时一次性固定。
+`SkillsPlugin._before_llm_call()` 只负责调用 domain prompt builder 并把结果接到 system prompt 后。
 
 ### 7. 当前用户侧显式 skill 命令是 `/skill list` 与 `/skill show`
 
@@ -127,17 +121,18 @@ basename 仅在唯一命中时作为兼容入口。
 
 这两个命令只做：
 
-- registry 发现结果展示
+- 当前 `SkillsPlugin` 注册的 `skill_registry` service 结果展示
 - skill 元信息 / 文档列表展示
 
 它们不直接修改 `SkillStateStore`。
+若 `SkillsPlugin` 未加载，命令层会直接提示 `skill_registry` 未注册，不再临时创建独立 registry。
 
-### 8. 当前 remote skill 入口不是 CLI 参数，而是 run 级请求或内联指令
+### 8. 当前 skill activation 入口是内联指令
 
-当前有效入口有两类：
+当前有效入口是用户输入中的 inline directive。
+入口层解析后会把请求放入：
 
-- `RuntimeSpec.remote_skill`
-- 用户输入中的 inline directive
+- `RuntimeContext.requested_skill`
 
 inline directive 由：
 
@@ -147,6 +142,11 @@ inline directive 由：
 
 - `[use skill](name) ...`
 - `[use skill name] ...`
+
+`parse_skill_activation_directive()` 当前会：
+
+- 去掉用户输入前缀中的 inline directive
+- 生成 `SkillActivationRequest`
 
 当前本地 CLI 已不再暴露 `--skill` / `--skill-doc` 这类参数入口。
 
@@ -173,12 +173,13 @@ inline directive 由：
 ## 关键入口
 
 - `src/luckbot/plugins/builtin/skills_plugin/__init__.py`
-- `src/luckbot/plugins/builtin/remote_skill_plugin/__init__.py`
+- `src/luckbot/plugins/builtin/skill_activation_plugin/__init__.py`
 - `src/luckbot/domains/skills/registry.py`
+- `src/luckbot/domains/skills/prompt.py`
 - `src/luckbot/domains/skills/state.py`
 - `src/luckbot/domains/skills/workspace.py`
 - `src/luckbot/domains/skills/directive.py`
-- `src/luckbot/core/runtime/core.py`
+- `src/luckbot/core/plugin/hooks.py`
 - `src/luckbot/entrypoints/cli.py`
 - `src/luckbot/application/commands/executor.py`
 
@@ -192,4 +193,5 @@ inline directive 由：
 
 - 同名 skill 只保留首次命中，目录优先级变化会直接改变生效结果
 - 追加型 `LUCKBOT_SKILLS_DIR` 不会覆盖更早命中的项目级 skill
+- 文档引用必须写完整相对路径，移动文档会影响已有指令
 - skill 状态是单次 run 语义，若调用方误以为会跨轮保留，容易造成预期偏差

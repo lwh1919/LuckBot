@@ -11,26 +11,20 @@
 才会被 ``memory_search`` 检索。
 
 本模块只管理 memory 根目录内的静态长期记忆路径与读写白名单。
-旧会话 transcript 的显式回看不走本模块路径白名单，而由读取工具直接解析
-``sessions/<session_id>.jsonl``。
 """
 
 
 from __future__ import annotations
 
-import os
 import shutil
 import hashlib
+import os
 from pathlib import Path
 
+from luckbot.domains.session import default_owner_id
 from luckbot.domains.session.state import resolve_state_dir
 
 from .types import IndexSourceDocument, MemoryPaths
-
-
-def owner_id_from_env() -> str:
-    """多用户隔离：``LUCKBOT_OWNER_ID``，默认 ``local``。"""
-    return (os.getenv("LUCKBOT_OWNER_ID", "") or "local").strip() or "local"
 
 
 def extra_paths_from_env() -> list[str]:
@@ -47,7 +41,7 @@ def resolve_memory_paths(
 ) -> MemoryPaths:
     """汇总当前用户的记忆根目录、markdown 子目录、索引库路径及额外 md 列表。"""
     root = state_dir or resolve_state_dir()
-    oid = (owner or owner_id_from_env()).strip() or "local"
+    oid = default_owner_id(owner or "local")
     memory_root = root / "memory" / oid
     memory_md = memory_root / "memory"
     index_db = memory_root / "index.sqlite"
@@ -167,25 +161,24 @@ def _norm_rel(rel: str) -> str:
     return s
 
 
-def is_allowed_memory_write_rel(rel: str, paths: MemoryPaths) -> bool:
-    """Flush 子 Agent 写盘白名单：仅 ``MEMORY.md`` 与 ``memory/**.md``（不含 ``extra/`` 外链）。"""
+def _memory_write_rel(rel: str) -> str | None:
     r = _norm_rel(rel)
     if not r or ".." in Path(r).parts:
-        return False
+        return None
     if not r.lower().endswith(".md"):
-        return False
+        return None
     if r == "MEMORY.md":
-        return True
+        return r
     if r.startswith("memory/"):
-        return True
-    return False
+        return r
+    return None
 
 
 def resolve_memory_write_path(rel: str, paths: MemoryPaths) -> Path | None:
     """写路径校验通过后返回绝对路径；否则 None。"""
-    if not is_allowed_memory_write_rel(rel, paths):
+    r = _memory_write_rel(rel)
+    if r is None:
         return None
-    r = _norm_rel(rel)
     base = Path(paths.memory_root)
     if r == "MEMORY.md":
         return (base / "MEMORY.md").resolve()
@@ -194,48 +187,25 @@ def resolve_memory_write_path(rel: str, paths: MemoryPaths) -> Path | None:
     return None
 
 
-def is_allowed_memory_read_rel(rel: str, paths: MemoryPaths) -> bool:
-    """memory_get 白名单：``MEMORY.md``、``memory/**.md``、``extra/*.md``（须匹配 extra 列表）。"""
+def _memory_read_rel(rel: str, paths: MemoryPaths) -> Path | None:
     r = _norm_rel(rel)
     if not r or ".." in Path(r).parts:
-        return False
+        return None
     if not r.lower().endswith(".md"):
-        return False
+        return None
+    base = Path(paths.memory_root)
     if r == "MEMORY.md":
-        return True
+        return (base / "MEMORY.md").resolve()
     if r.startswith("memory/"):
-        return True
+        return (base / r).resolve()
     if r.startswith("extra/"):
         name = Path(r).name
         for abs_ep in paths.extra_resolved:
             if Path(abs_ep).name == name:
-                return True
-    return False
+                return Path(abs_ep).resolve()
+    return None
 
 
 def resolve_memory_read_path(rel: str, paths: MemoryPaths) -> Path | None:
     """在白名单通过时返回磁盘绝对路径，否则 None（防目录穿越）。"""
-    if not is_allowed_memory_read_rel(rel, paths):
-        return None
-    r = _norm_rel(rel)
-    base = Path(paths.memory_root)
-    if r == "MEMORY.md":
-        return (base / "MEMORY.md").resolve()
-    if r.startswith("memory/"):
-        return (base / r).resolve()
-    if r.startswith("extra/"):
-        name = Path(r).name
-        for abs_ep in paths.extra_resolved:
-            p = Path(abs_ep)
-            if p.name == name:
-                return p.resolve()
-    return None
-
-
-def is_under_memory_root(abs_path: Path, paths: MemoryPaths) -> bool:
-    """判断绝对路径是否落在 ``memory_root`` 之下（写操作前可用）。"""
-    try:
-        abs_path.resolve().relative_to(Path(paths.memory_root).resolve())
-        return True
-    except ValueError:
-        return False
+    return _memory_read_rel(rel, paths)

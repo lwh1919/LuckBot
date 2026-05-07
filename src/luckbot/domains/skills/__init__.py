@@ -1,19 +1,21 @@
 """Skills domain."""
 
-from .directive import extract_remote_skill_directive
+from .directive import parse_skill_activation_directive
+from .prompt import build_skill_prompt
 from .registry import SkillRegistry
 from .state import SkillStateStore
-from .types import ExecResult, RemoteSkillRequest, SkillDoc, SkillInfo, SkillState
+from .types import ExecResult, SkillActivationRequest, SkillDoc, SkillInfo, SkillState
 from .workspace import SkillWorkspace
 
 __all__ = [
     "ExecResult",
-    "RemoteSkillRequest",
+    "SkillActivationRequest",
     "SkillDoc",
     "SkillInfo",
     "SkillRegistry",
     "SkillState",
     "SkillStateStore",
     "SkillWorkspace",
-    "extract_remote_skill_directive",
+    "build_skill_prompt",
+    "parse_skill_activation_directive",
 ]

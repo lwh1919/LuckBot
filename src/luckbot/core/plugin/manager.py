@@ -9,6 +9,7 @@ import sys
 from typing import Any, Callable
 
 from luckbot.core.config import resolve_project_path
+from luckbot.core.observability import log_exception
 from luckbot.core.plugin.base import LuckbotPlugin, PluginContext
 
 logger = logging.getLogger(__name__)
@@ -46,19 +47,22 @@ class PluginManager:
         sorted_plugins = self._topo_sort(all_plugins)
 
         for plugin in sorted_plugins:
-            logger.info("正在初始化插件: %s v%s", plugin.name, plugin.version)
             await plugin.initialize(self._ctx)
             self._plugins.append(plugin)
 
         self._initialised = True
-        logger.info("插件系统就绪（共 %d 个插件）", len(self._plugins))
 
     async def destroy(self) -> None:
         for plugin in reversed(self._plugins):
             try:
                 await plugin.destroy(self._ctx)
-            except Exception:
-                logger.exception("销毁插件 %s 时出错", plugin.name)
+            except Exception as exc:
+                log_exception(
+                    logger,
+                    "plugin.destroy_failed",
+                    exc,
+                    plugin_name=plugin.name,
+                )
         self._plugins.clear()
         self._ctx.reset()
         self._initialised = False
@@ -86,7 +90,6 @@ class PluginManager:
         """
         resolved = resolve_project_path(directory)
         if not os.path.isdir(resolved):
-            logger.debug("插件目录不存在: %s", resolved)
             return []
 
         found: list[LuckbotPlugin] = []
@@ -101,9 +104,13 @@ class PluginManager:
             try:
                 plugin = _load_plugin_package(resolved, name)
                 found.append(plugin)
-                logger.info("已从 %s 加载外部插件: %s", pkg_path, plugin.name)
-            except Exception:
-                logger.exception("从 %s 加载插件失败", pkg_path)
+            except Exception as exc:
+                log_exception(
+                    logger,
+                    "plugin.load_external_failed",
+                    exc,
+                    plugin_path=pkg_path,
+                )
         return found
 
     # -- 依赖感知的拓扑排序 -----------------------------------------------

@@ -43,7 +43,7 @@ LuckBot 当前是一个 CLI 优先、gateway 可复用的 Python Agent 工程。
 
 - 一个可直接本地使用的交互式 CLI
 - 一个可被 CLI 与飞书共同复用的长期运行 gateway
-- 一套统一的 runtime / plugin / subagent 基础设施
+- 一套统一的 runtime / plugin 基础设施
 - 一套可持久化、可检索、可归档的 session 与 memory 系统
 - 一套文档优先、spec 驱动的协作方式
 
@@ -56,18 +56,14 @@ LuckBot 当前是一个 CLI 优先、gateway 可复用的 Python Agent 工程。
 
 ## 当前一级结构
 
-- `main.py`
-  - 源码 checkout 下的兼容入口
-- `app/`
-  - 兼容旧 console script 的桥接层
 - `src/luckbot/entrypoints/`
-  - CLI / gateway 启动入口
+  - `luckbot` CLI 启动入口
 - `src/luckbot/adapters/gateway/`
   - FastAPI gateway、Feishu adapter、dispatcher、service
 - `src/luckbot/application/`
   - 命令执行、共享服务、系统提示等应用层
 - `src/luckbot/core/`
-  - runtime、plugin、llm、observability、config、subagent 等核心基础设施
+  - runtime、plugin、llm、observability、config 等核心基础设施
 - `src/luckbot/domains/`
   - session、memory、skills、mcp 等领域模块
 - `src/luckbot/plugins/builtin/`

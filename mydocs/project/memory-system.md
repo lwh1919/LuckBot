@@ -34,10 +34,15 @@
 
 - 构造 `EmbeddingProvider`
 - 注册 `memory_sync_now`
+- 注册 `memory_search` / `memory_get`
 - 注册 `before_run`、`before_llm_call`、`after_run`
 - 维护 `owner_id -> (MemoryPaths, MemoryIndex, tools...)` 的运行态缓存
 
 当前 `memory_search` / `memory_get` 不是固定绑定到单一 owner，而是随 run 的 `owner_id` 切换。
+
+当前工具注册发生在 `MemoryPlugin.initialize()` 阶段。
+工具执行时会读取当前 run 的 runtime context 中的 `owner_id` 来激活对应 owner；没有当前上下文时 fallback 到环境默认 owner。
+`before_run` 当前只负责激活 owner 与注入 `MEMORY_RECALL` prompt，不负责让 memory 工具出现。
 
 ### 2. 默认长期记忆目录在 `<project>/.luckbot/state/memory/<owner_id>/`
 
@@ -61,15 +66,15 @@
 
 当前默认分配是：
 
-- 本地 CLI：`owner_id = local`
-- gateway CLI：`owner_id = local`
-- 飞书：`owner_id = feishu:user:<open_id>`
+- 本地 CLI：`owner_id = LUCKBOT_OWNER_ID or local`
+- gateway CLI：`owner_id = LUCKBOT_OWNER_ID or request.owner_id or local`
+- 飞书：`owner_id = LUCKBOT_OWNER_ID or feishu:user:<open_id>`
 
 所以当前事实是：
 
-- 本地 CLI 与 gateway CLI 共享同一套长期记忆目录
+- 本地 CLI 与 gateway CLI 默认共享同一套长期记忆目录
 - 同一飞书用户的私聊与群聊共享同一套长期记忆目录
-- CLI 与飞书默认不共享长期记忆
+- 设置同一个 `LUCKBOT_OWNER_ID` 后，CLI 与飞书也共享同一套长期记忆目录
 
 ### 4. 统一索引只包含长期记忆，不包含 transcript
 
@@ -91,7 +96,7 @@
 
 所以当前 `memory_search` 的检索面只覆盖长期记忆层，不覆盖 raw session transcript。
 
-### 5. `memory_get` 既能读长期记忆，也能显式读旧会话
+### 5. `memory_get` 只读取长期记忆 Markdown
 
 工具入口位于：
 
@@ -107,12 +112,12 @@
 - `MEMORY.md`
 - `memory/*.md`
 - `extra/*.md`
-- `session:<session_id>`
 
 其中：
 
-- 读 `MEMORY.md` / `memory/*.md` / `extra/*.md` 时遵守当前 owner
-- 读 `session:<session_id>` 时直接解析 transcript
+- 读 `MEMORY.md` / `memory/*.md` 时遵守当前 owner
+- 读 `extra/*.md` 时只允许读取 `LUCKBOT_MEMORY_EXTRA_PATHS` 显式登记的 Markdown 文件
+- 不读取 raw session transcript
 
 ### 6. 当前 compaction 属于 memory 侧职责
 
@@ -128,6 +133,13 @@
 - 允许摘要消息被 session transcript 白名单持久化
 - 由 `SessionPlugin` 检测链变短后改为全量重写 transcript
 
+当前 compaction 保留最近消息时会维护 tool call 配对：
+
+- 不再简单按列表尾部切片
+- `AIMessage.tool_calls` 与其连续 `ToolMessage` 结果视为一个原子组
+- 若保留边界落在工具调用组中间，会向前扩展保留完整工具调用组
+- 已存在的孤立或不完整工具调用片段会被过滤，不进入压缩后的消息链
+
 ### 7. 当前 memory flush 只写长期记忆区
 
 实现位于：
@@ -138,6 +150,8 @@
 
 - `MEMORY.md`
 - `memory/**.md`
+
+`memory_write` 当前默认追加写入，只有显式传 `mode="overwrite"` 时才整文件覆盖。
 
 不会写：
 
@@ -153,9 +167,11 @@
 当前 `/session new` 会：
 
 1. 先 flush transcript
-2. 再把最近会话提炼成 `memory/YYYY-MM-DD-<slug>.md`
+2. 再把最近会话提炼成 `memory/sessions/YYYY-MM-DD/<session-id-short>-<slug>.md`
 3. 然后同步 memory 索引
 4. 最后轮转到新的活动会话
+
+归档路径带 `session_id` 前缀，并在目标文件已存在时追加数字后缀，因此同一天多个 channel 生成相同 slug 也不会覆盖已有 Markdown。
 
 所以当前 `/session new` 同时是：
 
@@ -190,6 +206,5 @@
 
 ## 风险
 
-- `memory_get(session:<session_id>)` 的接口名仍落在 memory 侧，容易让职责边界看起来比实际更宽
 - watcher 只绑定首次激活的 owner 目录；其它 owner 的 md 变更主要依赖显式同步或 run 后同步
 - `/session new`、compaction、归档链跨 session 与 memory 两侧，改动时必须同时核对两份真相文档

@@ -68,6 +68,5 @@ def knn_search(
             (q, k),
         )
         return [(int(r[0]), float(r[1])) for r in cur.fetchall()]
-    except Exception as e:
-        logger.debug("vec KNN 跳过: %s", e)
+    except Exception:
         return []

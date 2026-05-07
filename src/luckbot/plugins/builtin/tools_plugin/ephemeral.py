@@ -97,7 +97,6 @@ class EphemeralSandbox:
             except Exception as exc:
                 logger.warning("收集沙箱输出文件失败: %s", exc)
             shutil.rmtree(root, ignore_errors=True)
-            logger.debug("已删除沙箱目录: %s", root)
 
         return SandboxRunResult(
             returncode=returncode,

@@ -10,13 +10,16 @@ from collections import deque
 from typing import Any
 
 from luckbot.adapters.gateway.feishu.client import FeishuApiClient, build_status_card
-from luckbot.adapters.gateway.types import IncomingEnvelope, OutboundTarget, PlatformResponder, WebhookParseResult
+from luckbot.adapters.gateway.types import PlatformResponder, WebhookParseResult
+from luckbot.application.turns import IncomingTurn, OutboundTarget
+from luckbot.core.observability import log_exception
+from luckbot.domains.session import default_owner_id
 
 logger = logging.getLogger(__name__)
 
 
 class _FeishuResponder:
-    def __init__(self, client: FeishuApiClient, incoming: IncomingEnvelope) -> None:
+    def __init__(self, client: FeishuApiClient, incoming: IncomingTurn) -> None:
         self._client = client
         self._target = incoming.target
         self._card_message_id = ""
@@ -30,13 +33,13 @@ class _FeishuResponder:
                     receive_id_type=self._target.receive_id_type,
                     card=card,
                 )
-            except Exception:
-                logger.exception("feishu thinking card 发送失败")
+            except Exception as exc:
+                log_exception(logger, "feishu.progress_card_send_failed", exc)
             return
         try:
             await self._client.update_card(message_id=self._card_message_id, card=card)
-        except Exception:
-            logger.exception("feishu progress card 更新失败")
+        except Exception as exc:
+            log_exception(logger, "feishu.progress_card_update_failed", exc)
             self._card_message_id = ""
 
     async def send_final(self, text: str) -> None:
@@ -45,8 +48,8 @@ class _FeishuResponder:
             try:
                 await self._client.update_card(message_id=self._card_message_id, card=card)
                 return
-            except Exception:
-                logger.exception("feishu final card 更新失败，尝试降级发送新卡片")
+            except Exception as exc:
+                log_exception(logger, "feishu.final_card_update_failed", exc)
                 self._card_message_id = ""
         try:
             await self._client.send_card(
@@ -54,16 +57,16 @@ class _FeishuResponder:
                 receive_id_type=self._target.receive_id_type,
                 card=card,
             )
-        except Exception:
-            logger.exception("feishu final card 发送失败，尝试降级发送文本")
+        except Exception as exc:
+            log_exception(logger, "feishu.final_card_send_failed", exc)
             try:
                 await self._client.send_text(
                     receive_id=self._target.receive_id,
                     receive_id_type=self._target.receive_id_type,
                     text=text or "任务已完成，但未返回正文。",
                 )
-            except Exception:
-                logger.exception("feishu final text 发送失败")
+            except Exception as text_exc:
+                log_exception(logger, "feishu.final_text_send_failed", text_exc)
 
     async def send_error(self, text: str) -> None:
         card = build_status_card("LuckBot 执行失败", text or "未知错误")
@@ -71,8 +74,8 @@ class _FeishuResponder:
             try:
                 await self._client.update_card(message_id=self._card_message_id, card=card)
                 return
-            except Exception:
-                logger.exception("feishu error card 更新失败，尝试降级发送新卡片")
+            except Exception as exc:
+                log_exception(logger, "feishu.error_card_update_failed", exc)
                 self._card_message_id = ""
         try:
             await self._client.send_card(
@@ -80,16 +83,16 @@ class _FeishuResponder:
                 receive_id_type=self._target.receive_id_type,
                 card=card,
             )
-        except Exception:
-            logger.exception("feishu error card 发送失败，尝试降级发送文本")
+        except Exception as exc:
+            log_exception(logger, "feishu.error_card_send_failed", exc)
             try:
                 await self._client.send_text(
                     receive_id=self._target.receive_id,
                     receive_id_type=self._target.receive_id_type,
                     text=f"❌ {text or '未知错误'}",
                 )
-            except Exception:
-                logger.exception("feishu error text 发送失败")
+            except Exception as text_exc:
+                log_exception(logger, "feishu.error_text_send_failed", text_exc)
 
 
 class FeishuAdapter:
@@ -186,8 +189,9 @@ class FeishuAdapter:
             if not text:
                 return WebhookParseResult()
 
-        incoming = IncomingEnvelope(
-            platform="feishu",
+        incoming = IncomingTurn(
+            channel="feishu",
+            transport="webhook",
             chat_type=chat_type,
             chat_id=chat_id,
             user_id=open_id,
@@ -198,7 +202,7 @@ class FeishuAdapter:
                 if chat_type == "group"
                 else f"feishu:{open_id}"
             ),
-            owner_id=f"feishu:user:{open_id}",
+            owner_id=default_owner_id(f"feishu:user:{open_id}"),
             target=OutboundTarget(
                 receive_id=chat_id if chat_type == "group" else open_id,
                 receive_id_type="chat_id" if chat_type == "group" else "open_id",
@@ -210,7 +214,7 @@ class FeishuAdapter:
         )
         return WebhookParseResult(ack_payload={}, incoming=incoming)
 
-    async def create_responder(self, incoming: IncomingEnvelope) -> PlatformResponder:
+    async def create_responder(self, incoming: IncomingTurn) -> PlatformResponder:
         return _FeishuResponder(self._client, incoming)
 
     def _seen(self, message_id: str) -> bool:

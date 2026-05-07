@@ -72,6 +72,30 @@ class SessionPlugin(LuckbotPlugin):
     def _effective_owner_id(owner_id: str | None, fallback: str) -> str:
         return (owner_id or fallback or "local").strip() or "local"
 
+    def _set_identity(
+        self,
+        *,
+        session_key: str | None,
+        owner_id: str | None,
+    ) -> None:
+        self._session_key = self._effective_session_key(session_key, self._session_key)
+        self._owner_id = self._effective_owner_id(owner_id, self._owner_id)
+
+    def _span_attrs(
+        self,
+        *,
+        session_key: str | None = None,
+        owner_id: str | None = None,
+    ) -> dict[str, str]:
+        return {
+            "luckbot.session_key": session_key or self._session_key,
+            "luckbot.owner_id": owner_id or self._owner_id,
+        }
+
+    def _mark_flushed(self, message_count: int) -> None:
+        self._persisted_len = message_count
+        touch_session_updated(self._session_id, self._session_key)
+
     def begin_new_session(
         self,
         *,
@@ -83,15 +107,12 @@ class SessionPlugin(LuckbotPlugin):
             self._persisted_len = 0
             self._force_full_transcript_rewrite = False
             return "会话持久化已关闭（LUCKBOT_SESSION_PERSIST），仅重置内存会话"
-        effective_key = self._effective_session_key(session_key, self._session_key)
-        effective_owner = self._effective_owner_id(owner_id, self._owner_id)
-        meta = rotate_session(effective_key, owner_id=effective_owner)
-        self._session_key = effective_key
-        self._owner_id = effective_owner
+        self._set_identity(session_key=session_key, owner_id=owner_id)
+        meta = rotate_session(self._session_key, owner_id=self._owner_id)
         self._session_id = meta.session_id
         self._persisted_len = 0
         self._force_full_transcript_rewrite = False
-        touch_session_updated(self._session_id, effective_key)
+        touch_session_updated(self._session_id, self._session_key)
         return f"已开始新会话: {self._session_id}"
 
     async def _before_run(self, inp: BeforeRunInput) -> BeforeRunResult | None:
@@ -99,25 +120,24 @@ class SessionPlugin(LuckbotPlugin):
             return None
         with start_span(
             "session.resolve",
-            attributes={
-                "luckbot.session_key": inp.session_key,
-                "luckbot.owner_id": inp.owner_id,
-            },
+            attributes=self._span_attrs(
+                session_key=inp.session_key,
+                owner_id=inp.owner_id,
+            ),
         ):
-            self._session_key = self._effective_session_key(inp.session_key, self._session_key)
-            self._owner_id = self._effective_owner_id(inp.owner_id, self._owner_id)
+            self._set_identity(session_key=inp.session_key, owner_id=inp.owner_id)
             self._force_full_transcript_rewrite = False
             meta = resolve_session(self._session_key, owner_id=self._owner_id)
             self._session_id = meta.session_id
-            if inp.conversation_history:
-                self._persisted_len = len(inp.conversation_history)
+            if len(inp.messages) > 1:
+                self._persisted_len = len(inp.messages) - 1
                 return None
             loaded = load_transcript_messages(self._session_id)
             if not loaded:
                 self._persisted_len = 0
                 return None
             self._persisted_len = len(loaded)
-            return BeforeRunResult(conversation_history=loaded)
+            return BeforeRunResult(messages=[*loaded, *inp.messages])
 
     async def _before_llm(self, inp: BeforeLLMCallInput) -> None:
         """在 Memory等插件完成 before_llm_call 之后注册顺序靠后：检测压缩是否缩短消息链。"""
@@ -151,13 +171,9 @@ class SessionPlugin(LuckbotPlugin):
             return "会话持久化已关闭（LUCKBOT_SESSION_PERSIST）"
         with start_span(
             "session.flush",
-            attributes={
-                "luckbot.session_key": session_key or self._session_key,
-                "luckbot.owner_id": owner_id or self._owner_id,
-            },
+            attributes=self._span_attrs(session_key=session_key, owner_id=owner_id),
         ):
-            self._session_key = self._effective_session_key(session_key, self._session_key)
-            self._owner_id = self._effective_owner_id(owner_id, self._owner_id)
+            self._set_identity(session_key=session_key, owner_id=owner_id)
             meta = resolve_session(self._session_key, owner_id=self._owner_id)
             self._session_id = meta.session_id
 
@@ -165,8 +181,7 @@ class SessionPlugin(LuckbotPlugin):
                 rewrite_transcript_messages(self._session_id, messages)
                 self._force_full_transcript_rewrite = False
                 n = len(messages)
-                self._persisted_len = n
-                touch_session_updated(self._session_id, self._session_key)
+                self._mark_flushed(n)
                 increment_counter("luckbot_session_flush_total", attributes={"mode": "rewrite"})
                 return f"已全量写入 {n} 条消息"
 
@@ -178,8 +193,7 @@ class SessionPlugin(LuckbotPlugin):
             )
             if lines:
                 append_transcript_lines(self._session_id, lines)
-            self._persisted_len = len(messages)
-            touch_session_updated(self._session_id, self._session_key)
+            self._mark_flushed(len(messages))
             increment_counter("luckbot_session_flush_total", attributes={"mode": "append"})
             if not lines:
                 return "无新消息需保存"

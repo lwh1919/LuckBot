@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 
-from .types import RemoteSkillRequest, SkillState
+from .types import SkillActivationRequest, SkillState
 
 
 class SkillStateStore:
@@ -25,7 +25,7 @@ class SkillStateStore:
     def select_docs(self, skill_name: str, docs: list[str]) -> None:
         self._state.selected_docs[skill_name] = list(docs)
 
-    def preload(self, request: RemoteSkillRequest) -> None:
+    def preload(self, request: SkillActivationRequest) -> None:
         self.mark_loaded(request.skill_name)
         if request.docs:
             self.select_docs(request.skill_name, request.docs)

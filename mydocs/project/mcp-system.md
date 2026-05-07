@@ -68,6 +68,7 @@
 - `config`
   - 默认值
   - 配置文件 `mtime` 不变时复用缓存
+  - 即使上次成功加载得到 0 个工具，也会复用这次空结果
 - `always`
   - 每次 `before_run` 都重建工具
 
@@ -87,7 +88,18 @@
 
 不支持的 transport 或缺少必填字段的 server 会被跳过，不会阻断其它 server。
 
-### 6. 当前每个 server 独立加载，单个失败不阻断其它 server
+### 6. 当前 stdio server 的 stderr 会被静默处理
+
+stdio MCP server 由第三方 MCP SDK 启动子进程。
+SDK 默认会把 server 的 stderr 接到当前进程 stderr；LuckBot 当前在加载 stdio MCP server 前会安装静默 stderr 包装，避免 server 启动提示污染 CLI 对话界面。
+
+因此当前语义是：
+
+- stdio server 的普通 stderr 输出不直接显示在终端
+- MCP 配置、连接、拉取工具失败仍由 LuckBot warning / error 记录或命令结果提示
+- HTTP / SSE transport 不受这个处理影响
+
+### 7. 当前每个 server 独立加载，单个失败不阻断其它 server
 
 当前流程是：
 
@@ -104,8 +116,9 @@
 - 某个 server 拉工具时报错
 
 只影响这个 server。
+如果某个 server 已创建 client 但拉工具失败，当前会尽力关闭该 client，避免它脱离 registry 生命周期。
 
-### 7. 工具名当前统一改写为 `mcp_<server_name>_<tool_name>`
+### 8. 工具名当前统一改写为 `mcp_<server_name>_<tool_name>`
 
 当前这样做的结果是：
 
@@ -114,7 +127,7 @@
 
 若同一 server 自身返回重名工具，后写入者会覆盖前者。
 
-### 8. MCP 工具当前只在 run-time merge 后可用
+### 9. MCP 工具当前只在 run-time merge 后可用
 
 当前 MCP 插件不会把工具写进常驻工具表。
 
@@ -124,9 +137,15 @@
 - 合并本轮 MCP 工具
 - 返回 `BeforeRunResult(tools=merged_tools)`
 
-所以当前 `/mcp list` 想看到真正可用工具，必须显式走一次同样的 `before_run` 合并流程。
+`MCPPlugin` 同时注册命令查询 service：
 
-### 9. `/mcp list` 现在由共享命令层提供，不在旧 CLI 文件里
+- `mcp_config_snapshot`
+- `mcp_tool_names`
+
+所以当前 `/mcp list` 通过同一个 `MCPPlugin` / `MCPToolRegistry` 获取配置快照与工具名，
+不再由命令层模拟 `before_run`。
+
+### 10. `/mcp list` 现在由共享命令层提供，不在旧 CLI 文件里
 
 当前 `/mcp list` 的实现位于：
 
@@ -135,11 +154,11 @@
 它会同时展示：
 
 1. `.luckbot/mcp.json` 中声明的 server
-2. 一次 `before_run` 合并后实际可见的 `mcp_` 工具名
+2. 当前 `MCPPlugin` 通过 `mcp_tool_names` 暴露的工具名
 
 所以配置存在不代表工具一定成功可用。
 
-### 10. `.luckbot/mcp.json` 仍属于本地运行时输入，不属于项目知识真相本体
+### 11. `.luckbot/mcp.json` 仍属于本地运行时输入，不属于项目知识真相本体
 
 当前模块真相只定义：
 

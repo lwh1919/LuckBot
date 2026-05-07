@@ -74,7 +74,7 @@
 - `.luckbot/state/sessions/sessions.json`
 - `.luckbot/state/sessions/<session_id>.jsonl`
 
-如果项目内 state 目录尚未建立，但检测到旧的 `~/.luckbot` 运行态数据，当前会把缺失文件复制到项目内 state。
+当前不会从旧的 `~/.luckbot` 运行态目录自动迁移数据。
 
 ### 4. 不同入口的 `session_key` 当前明确分流
 
@@ -98,13 +98,14 @@
 
 当前默认 `owner_id` 分配是：
 
-- 本地 CLI：`local`
-- gateway CLI：`local`
-- 飞书：`feishu:user:<open_id>`
+- 本地 CLI：`LUCKBOT_OWNER_ID or local`
+- gateway CLI：`LUCKBOT_OWNER_ID or request.owner_id or local`
+- 飞书：`LUCKBOT_OWNER_ID or feishu:user:<open_id>`
 
 所以当前事实是：
 
-- 本地 CLI 与 gateway CLI 默认共用 `memory/local`
+- 本地 CLI 与 gateway CLI 默认共用同一 owner 的长期记忆
+- 设置同一个 `LUCKBOT_OWNER_ID` 后，CLI 与飞书也共用同一 owner 的长期记忆
 - 但它们仍然各自维护独立 transcript
 - 同一飞书用户的私聊与群聊默认共用同一套长期记忆 owner
 
@@ -128,6 +129,13 @@
 - 普通 `SystemMessage` 默认不落盘
 - compaction 摘要白名单 `SystemMessage` 可以落盘
 
+当前 transcript 读写会规范化 tool call 配对：
+
+- 孤立 `ToolMessage` 会被过滤
+- `AIMessage.tool_calls` 必须和后续连续 `ToolMessage.tool_call_id` 完整匹配
+- 不完整、重复或未知 `tool_call_id` 的工具调用片段会整组丢弃
+- 该规则同时作用于 transcript 恢复与写盘，避免非法历史消息污染下一轮 LLM 请求
+
 `load_transcript_messages(session_id)` 会按 JSONL 顺序恢复消息；文件不存在或整文件损坏时返回空列表。
 
 ### 7. 恢复与写盘由 `before_run` / `after_run` 驱动
@@ -136,8 +144,8 @@
 
 - 解析本次 run 的有效 `session_key` / `owner_id`
 - 调 `resolve_session()` 取得活动 `session_id`
-- 若当前进程已有 `conversation_history`，以内存为准
-- 否则从对应 transcript 恢复磁盘消息
+- 若当前 run 的 `messages` 已包含历史与本轮消息，以内存消息链为准
+- 若当前 run 只有本轮消息，则从对应 transcript 恢复磁盘消息，并把本轮消息接到恢复链后
 
 `SessionPlugin._after_run()` 当前行为：
 
@@ -171,15 +179,20 @@
 - 可能把旧会话沉淀为长期记忆 Markdown
 - 为当前 `session_key` 轮转出新的活动 `session_id`
 
-### 9. 旧会话显式回看仍通过 `session:<session_id>`
+当前 session 是短期对话 / transcript 维度；长期记忆归属由 `owner_id` 决定。
+不同 channel 的 session 不合并，但可以通过相同 `LUCKBOT_OWNER_ID` 共享长期记忆。
 
-当前旧会话读取规范是：
+### 9. 旧会话显式回看属于 session 侧能力
+
+当前旧会话底层读取规范仍是：
 
 - `session:<session_id>`
 
-读取时底层仍解析：
+读取时底层解析：
 
 - `.luckbot/state/sessions/<session_id>.jsonl`
+
+但该能力不再通过 `memory_get` 暴露。`memory_get` 当前只读取长期记忆 Markdown。
 
 它返回的是整理后的文本视图，不是原始 JSONL 行。
 

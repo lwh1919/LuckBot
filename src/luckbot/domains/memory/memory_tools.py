@@ -10,19 +10,9 @@ from typing import Any
 from langchain_core.tools import tool
 
 from luckbot.core.config.env_parse import env_float, env_int
-from luckbot.domains.session.transcript import (
-    is_allowed_session_read_path,
-    load_transcript_read_view,
-    session_read_path,
-    session_read_path_to_session_id,
-)
-
 from .embeddings import EmbeddingProvider
 from .index_db import MemoryIndex
-from .paths import (
-    is_allowed_memory_read_rel,
-    resolve_memory_read_path,
-)
+from .paths import resolve_memory_read_path
 from .search import hits_to_json_payload, hybrid_search
 from .types import MemoryPaths, SearchOptions
 
@@ -79,31 +69,19 @@ def build_memory_get_tool(paths: MemoryPaths) -> Any:
 
     @tool
     async def memory_get(path: str, from_line: int = 0, lines: int = 0) -> str:
-        """安全读取记忆 Markdown，或显式回看旧会话片段。适用于回看上下文、长文阅读或精确措辞确认；
-        支持 MEMORY.md、memory/*.md、extra/*.md，以及 ``session:<session_id>``。
+        """安全读取长期记忆 Markdown。适用于回看上下文、长文阅读或精确措辞确认；
+        支持 MEMORY.md、memory/*.md、extra/*.md。
         from_line/lines 为 1-based 行号区间。"""
         rel = path.strip().replace("\\", "/")
-        all_lines: list[str]
-        out_path = rel
-        if is_allowed_memory_read_rel(rel, paths):
-            p = resolve_memory_read_path(rel, paths)
-            if p is None or not p.is_file():
-                return json.dumps({"error": "文件不存在", "path": path})
-            try:
-                all_lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
-            except OSError as e:
-                return json.dumps({"error": str(e), "path": path})
-        elif is_allowed_session_read_path(rel):
-            session_id = session_read_path_to_session_id(rel)
-            if not session_id:
-                return json.dumps({"error": "path 不允许", "path": path})
-            text = load_transcript_read_view(session_id)
-            if not text:
-                return json.dumps({"error": "会话为空或不存在", "path": path})
-            all_lines = text.splitlines()
-            out_path = session_read_path(session_id)
-        else:
+        p = resolve_memory_read_path(rel, paths)
+        if p is None:
             return json.dumps({"error": "path 不允许", "path": path})
+        if not p.is_file():
+            return json.dumps({"error": "文件不存在", "path": path})
+        try:
+            all_lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError as e:
+            return json.dumps({"error": str(e), "path": path})
         total = len(all_lines)
         cap = env_int("LUCKBOT_MEMORY_GET_MAX_LINES", 500)
         if from_line <= 0:
@@ -115,7 +93,7 @@ def build_memory_get_tool(paths: MemoryPaths) -> Any:
         if end - start > cap:
             chunk = chunk[:cap]
         text = "\n".join(chunk)
-        return json.dumps({"text": text, "path": out_path}, ensure_ascii=False)
+        return json.dumps({"text": text, "path": rel}, ensure_ascii=False)
 
     return memory_get
 

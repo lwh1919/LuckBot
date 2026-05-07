@@ -1,48 +1,17 @@
-"""平台无关 gateway 类型。"""
+"""平台无关 gateway responder / adapter 协议。"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal, Protocol
+from typing import Any, Protocol
 
-ReceiveIdType = Literal["open_id", "chat_id"]
-ChatType = Literal["dm", "group"]
-
-
-@dataclass(slots=True)
-class OutboundTarget:
-    receive_id: str
-    receive_id_type: ReceiveIdType
-    source_message_id: str | None = None
-
-
-@dataclass(slots=True)
-class IncomingEnvelope:
-    platform: str
-    chat_type: ChatType
-    chat_id: str
-    user_id: str
-    message_id: str
-    text: str
-    session_key: str
-    owner_id: str
-    target: OutboundTarget
-    mentions: list[str] = field(default_factory=list)
-    attachments: list[dict[str, Any]] = field(default_factory=list)
-    trace_id: str | None = None
-    raw_event: dict[str, Any] = field(default_factory=dict)
+from luckbot.application.turns import IncomingTurn, TurnResult
 
 
 @dataclass(slots=True)
 class WebhookParseResult:
     ack_payload: dict[str, Any] = field(default_factory=dict)
-    incoming: IncomingEnvelope | None = None
-
-
-@dataclass(slots=True)
-class GatewayRunResult:
-    final_text: str
-    messages: list[Any]
+    incoming: IncomingTurn | None = None
 
 
 class PlatformResponder(Protocol):
@@ -60,9 +29,8 @@ class PlatformAdapter(Protocol):
 
     def parse_request(self, headers: dict[str, str], body: bytes) -> WebhookParseResult: ...
 
-    async def create_responder(self, incoming: IncomingEnvelope) -> PlatformResponder: ...
+    async def create_responder(self, incoming: IncomingTurn) -> PlatformResponder: ...
 
 
 class GatewayRunner(Protocol):
-    async def run_turn(self, incoming: IncomingEnvelope) -> GatewayRunResult: ...
-
+    async def run_turn(self, incoming: IncomingTurn) -> TurnResult: ...

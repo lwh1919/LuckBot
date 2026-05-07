@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import importlib
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
@@ -10,10 +10,10 @@ from luckbot.domains.session.state import resolve_session
 from luckbot.domains.session import build_gateway_cli_session_key, build_local_session_key
 from luckbot.domains.session.transcript import append_transcript_lines, messages_to_jsonl_lines
 from luckbot.application.commands import CommandContext, execute_command, render_help_text, tokenize_command
-from luckbot.adapters.gateway.types import IncomingEnvelope, OutboundTarget
+from luckbot.application.turn_runner import AgentTurnRunner
+from luckbot.application.turns import IncomingTurn, OutboundTarget
 
-cli_module = importlib.import_module("luckbot.entrypoints.cli")
-gateway_service_module = importlib.import_module("luckbot.adapters.gateway.service")
+import luckbot.application.turn_runner as turn_runner_module
 
 
 @dataclass
@@ -63,6 +63,39 @@ class _FakePluginManager:
         return []
 
 
+class _FakeSkillRegistry:
+    def __init__(self, skills: list[object]) -> None:
+        self._skills = {str(skill.name): skill for skill in skills}
+
+    def all_skills(self) -> list[object]:
+        return list(self._skills.values())
+
+    def resolve(self, name: str) -> object | None:
+        return self._skills.get(name)
+
+
+def _incoming_turn(
+    text: str,
+    *,
+    channel: str = "cli",
+    transport: str = "local",
+    session_key: str = "local:default",
+    owner_id: str = "local",
+) -> IncomingTurn:
+    return IncomingTurn(
+        channel=channel,
+        transport=transport,
+        chat_type="dm",
+        chat_id="oc_x",
+        user_id="ou_x",
+        message_id="om_x",
+        text=text,
+        session_key=session_key,
+        owner_id=owner_id,
+        target=OutboundTarget(receive_id="ou_x", receive_id_type="open_id"),
+    )
+
+
 def test_tokenize_command_handles_slash_and_plain_text() -> None:
     assert tokenize_command("hello") is None
 
@@ -87,10 +120,11 @@ def test_local_and_gateway_cli_sessions_use_distinct_namespaces() -> None:
 
 
 @pytest.mark.asyncio
-async def test_execute_command_skill_show_reports_missing_skill() -> None:
+async def test_execute_command_skill_requires_plugin_service() -> None:
     result = await execute_command(
-        "/skill show missing",
+        "/skill list",
         CommandContext(
+            channel="cli",
             transport="cli",
             plugin_manager=_FakePluginManager(),
             conversation_history=[],
@@ -98,7 +132,95 @@ async def test_execute_command_skill_show_reports_missing_skill() -> None:
     )
 
     assert result.handled is True
-    assert "未找到名为" in result.final_text
+    assert "未注册 skill_registry" in result.final_text
+
+
+@pytest.mark.asyncio
+async def test_execute_command_skill_uses_plugin_registry_service() -> None:
+    registry = _FakeSkillRegistry(
+        [
+            SimpleNamespace(
+                name="demo",
+                description="demo skill",
+                when_to_use="demo only",
+                docs=[SimpleNamespace(name="guide.md", description="Guide")],
+                location="/tmp/demo/SKILL.md",
+            )
+        ]
+    )
+
+    result = await execute_command(
+        "/skill show demo",
+        CommandContext(
+            channel="cli",
+            transport="cli",
+            plugin_manager=_FakePluginManager(services={"skill_registry": registry}),
+            conversation_history=[],
+        ),
+    )
+
+    assert result.handled is True
+    assert "Skill: demo" in result.final_text
+    assert "guide.md: Guide" in result.final_text
+
+
+@pytest.mark.asyncio
+async def test_execute_command_mcp_list_uses_plugin_services() -> None:
+    calls: list[str] = []
+
+    def _config_snapshot() -> object:
+        calls.append("config")
+        return SimpleNamespace(
+            path="/tmp/mcp.json",
+            exists=True,
+            error=None,
+            servers={
+                "demo": {
+                    "transport": "stdio",
+                    "command": "demo-server",
+                }
+            },
+        )
+
+    async def _tool_names() -> list[str]:
+        calls.append("tools")
+        return ["mcp_demo_echo"]
+
+    result = await execute_command(
+        "/mcp list",
+        CommandContext(
+            channel="cli",
+            transport="cli",
+            plugin_manager=_FakePluginManager(
+                services={
+                    "mcp_config_snapshot": _config_snapshot,
+                    "mcp_tool_names": _tool_names,
+                }
+            ),
+            conversation_history=[],
+        ),
+    )
+
+    assert result.handled is True
+    assert calls == ["config", "tools"]
+    assert "demo: stdio demo-server" in result.final_text
+    assert "mcp_demo_echo" in result.final_text
+
+
+@pytest.mark.asyncio
+async def test_execute_command_mcp_list_requires_plugin_services() -> None:
+    result = await execute_command(
+        "/mcp list",
+        CommandContext(
+            channel="cli",
+            transport="cli",
+            plugin_manager=_FakePluginManager(),
+            conversation_history=[],
+        ),
+    )
+
+    assert result.handled is True
+    assert "未注册 MCP 查询服务" in result.final_text
 
 
 @pytest.mark.asyncio
@@ -136,6 +258,7 @@ async def test_execute_command_session_new_uses_services_and_clears_history(
     result = await execute_command(
         "/session new",
         CommandContext(
+            channel="cli",
             transport="cli",
             plugin_manager=_FakePluginManager(
                 services={
@@ -163,6 +286,7 @@ async def test_execute_command_session_export_rejects_invalid_tail() -> None:
     result = await execute_command(
         "/session export --tail nope",
         CommandContext(
+            channel="cli",
             transport="cli",
             plugin_manager=_FakePluginManager(),
             conversation_history=[],
@@ -174,121 +298,81 @@ async def test_execute_command_session_export_rejects_invalid_tail() -> None:
 
 
 @pytest.mark.asyncio
-async def test_cli_handle_user_input_routes_command_without_agent_loop(
+async def test_agent_turn_runner_routes_command_without_runtime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def _raise_agent_loop(*_args, **_kwargs):
-        raise AssertionError("agent_loop should not be called for slash commands")
+    monkeypatch.setenv("LUCKBOT_SESSION_PERSIST", "0")
+    fake_pm = _FakePluginManager()
+    monkeypatch.setattr(turn_runner_module, "PluginManager", lambda: fake_pm)
+    monkeypatch.setattr(turn_runner_module, "discover_builtin_plugins", lambda: [])
 
-    monkeypatch.setattr(cli_module, "agent_loop", _raise_agent_loop)
+    async def _raise_runtime(*_args, **_kwargs):
+        raise AssertionError("run_runtime should not be called for slash commands")
 
-    result, updated_history, handled = await cli_module._handle_user_input(
-        "/help",
-        pm=_FakePluginManager(),
-        conversation_history=[],
-        session_key="default",
-        max_steps=5,
-    )
+    monkeypatch.setattr(turn_runner_module, "run_runtime", _raise_runtime)
 
-    assert handled is True
-    assert "可用命令" in result
-    assert updated_history == []
+    result = await AgentTurnRunner(max_steps=5).run_turn(_incoming_turn("/help"))
+
+    assert result.handled_as_command is True
+    assert "可用命令" in result.final_text
+    assert result.messages == []
+    assert fake_pm.destroyed is True
 
 
 @pytest.mark.asyncio
-async def test_cli_handle_user_input_routes_plain_text_to_agent_loop(
+async def test_agent_turn_runner_routes_plain_text_to_runtime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def _fake_agent_loop(*_args, **_kwargs):
-        return ("done", [HumanMessage(content="hello"), AIMessage(content="done")])
+    monkeypatch.setenv("LUCKBOT_SESSION_PERSIST", "0")
+    fake_pm = _FakePluginManager()
+    monkeypatch.setattr(turn_runner_module, "PluginManager", lambda: fake_pm)
+    monkeypatch.setattr(turn_runner_module, "discover_builtin_plugins", lambda: [])
 
-    monkeypatch.setattr(cli_module, "agent_loop", _fake_agent_loop)
+    async def _fake_runtime(spec):
+        assert len(spec.messages) == 1
+        assert isinstance(spec.messages[0], HumanMessage)
+        assert spec.messages[0].content == "hello"
+        assert spec.plugin_manager is fake_pm
+        return _FakeRuntimeResult(
+            final_text="done",
+            messages=[HumanMessage(content="hello"), AIMessage(content="done")],
+        )
 
-    result, updated_history, handled = await cli_module._handle_user_input(
-        "hello",
-        pm=_FakePluginManager(),
-        conversation_history=[],
-        session_key="default",
-        max_steps=5,
-    )
+    monkeypatch.setattr(turn_runner_module, "run_runtime", _fake_runtime)
 
-    assert handled is False
-    assert result == "done"
-    assert len(updated_history) == 2
+    result = await AgentTurnRunner(max_steps=5).run_turn(_incoming_turn("hello"))
+
+    assert result.handled_as_command is False
+    assert result.final_text == "done"
+    assert len(result.messages) == 2
+    assert fake_pm.destroyed is True
 
 
 @pytest.mark.asyncio
-async def test_run_once_gateway_routes_plain_text_to_gateway_client(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[str] = []
-    monkeypatch.setenv("LUCKBOT_SESSION", "gateway-demo")
-    monkeypatch.setattr(cli_module, "_ensure_gateway_running", lambda: None)
-
-    def _fake_send_turn(text: str, *, session_name: str | None = None, owner_id=None, trace_id=None):
-        del owner_id, trace_id
-        calls.append(f"{session_name}:{text}")
-        return type("_R", (), {"final_text": "done"})()
-
-    monkeypatch.setattr(cli_module, "send_gateway_turn", _fake_send_turn)
-
-    rc = await cli_module._run_once_gateway("hello", as_command=False)
-
-    assert rc == 0
-    assert calls == ["gateway-demo:hello"]
-
-
-@pytest.mark.asyncio
-async def test_run_once_gateway_routes_slash_command_to_gateway_client(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[str] = []
-    monkeypatch.setenv("LUCKBOT_SESSION", "gateway-demo")
-    monkeypatch.setattr(cli_module, "_ensure_gateway_running", lambda: None)
-
-    def _fake_send_command(text: str, *, session_name: str | None = None, owner_id=None, trace_id=None):
-        del owner_id, trace_id
-        calls.append(f"{session_name}:{text}")
-        return type("_R", (), {"final_text": "done"})()
-
-    monkeypatch.setattr(cli_module, "send_gateway_command", _fake_send_command)
-
-    rc = await cli_module._run_once_gateway("/help", as_command=True)
-
-    assert rc == 0
-    assert calls == ["gateway-demo:/help"]
-
-
-@pytest.mark.asyncio
-async def test_gateway_service_handles_command_without_runtime(
+async def test_agent_turn_runner_handles_gateway_command_without_runtime(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
     monkeypatch.setenv("LUCKBOT_STATE_DIR", str(tmp_path))
     monkeypatch.setenv("LUCKBOT_PROJECT_ROOT", str(tmp_path))
     fake_pm = _FakePluginManager(plugins=[("demo-plugin", "1.0.0")])
-    monkeypatch.setattr(gateway_service_module, "PluginManager", lambda: fake_pm)
-    monkeypatch.setattr(gateway_service_module, "discover_builtin_plugins", lambda: [])
+    monkeypatch.setattr(turn_runner_module, "PluginManager", lambda: fake_pm)
+    monkeypatch.setattr(turn_runner_module, "discover_builtin_plugins", lambda: [])
 
     async def _raise_runtime(*_args, **_kwargs):
         raise AssertionError("run_runtime should not be called for slash commands")
 
-    monkeypatch.setattr(gateway_service_module, "run_runtime", _raise_runtime)
+    monkeypatch.setattr(turn_runner_module, "run_runtime", _raise_runtime)
 
-    service = gateway_service_module.LuckBotGatewayService()
-    incoming = IncomingEnvelope(
-        platform="feishu",
-        chat_type="dm",
-        chat_id="oc_x",
-        user_id="ou_x",
-        message_id="om_x",
-        text="/plugin list",
+    incoming = _incoming_turn(
+        "/plugin list",
+        channel="feishu",
+        transport="webhook",
         session_key="feishu:ou_x",
         owner_id="feishu:user:ou_x",
-        target=OutboundTarget(receive_id="ou_x", receive_id_type="open_id"),
     )
 
-    result = await service.run_turn(incoming)
+    result = await AgentTurnRunner().run_turn(incoming)
 
     assert "demo-plugin v1.0.0" in result.final_text
     assert fake_pm.initialized_with is not None
@@ -297,37 +381,37 @@ async def test_gateway_service_handles_command_without_runtime(
 
 
 @pytest.mark.asyncio
-async def test_gateway_service_uses_runtime_for_plain_text(
+async def test_agent_turn_runner_uses_runtime_for_gateway_plain_text(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
     monkeypatch.setenv("LUCKBOT_STATE_DIR", str(tmp_path))
     monkeypatch.setenv("LUCKBOT_PROJECT_ROOT", str(tmp_path))
     fake_pm = _FakePluginManager()
-    monkeypatch.setattr(gateway_service_module, "PluginManager", lambda: fake_pm)
-    monkeypatch.setattr(gateway_service_module, "discover_builtin_plugins", lambda: [])
+    monkeypatch.setattr(turn_runner_module, "PluginManager", lambda: fake_pm)
+    monkeypatch.setattr(turn_runner_module, "discover_builtin_plugins", lambda: [])
 
     async def _fake_runtime(spec):
-        assert spec.user_input == "hello"
+        assert len(spec.messages) == 1
+        assert isinstance(spec.messages[0], HumanMessage)
+        assert spec.messages[0].content == "hello"
         assert spec.plugin_manager is fake_pm
+        assert spec.platform == "feishu"
+        assert spec.session_key == "feishu:ou_x"
+        assert spec.owner_id == "feishu:user:ou_x"
         return _FakeRuntimeResult(final_text="runtime done", messages=[HumanMessage(content="hello")])
 
-    monkeypatch.setattr(gateway_service_module, "run_runtime", _fake_runtime)
+    monkeypatch.setattr(turn_runner_module, "run_runtime", _fake_runtime)
 
-    service = gateway_service_module.LuckBotGatewayService()
-    incoming = IncomingEnvelope(
-        platform="feishu",
-        chat_type="dm",
-        chat_id="oc_x",
-        user_id="ou_x",
-        message_id="om_x",
-        text="hello",
+    incoming = _incoming_turn(
+        "hello",
+        channel="feishu",
+        transport="webhook",
         session_key="feishu:ou_x",
         owner_id="feishu:user:ou_x",
-        target=OutboundTarget(receive_id="ou_x", receive_id_type="open_id"),
     )
 
-    result = await service.run_turn(incoming)
+    result = await AgentTurnRunner().run_turn(incoming)
 
     assert result.final_text == "runtime done"
     assert fake_pm.initialized_with is not None
@@ -336,36 +420,76 @@ async def test_gateway_service_uses_runtime_for_plain_text(
 
 
 @pytest.mark.asyncio
-async def test_build_plugin_manager_uses_project_relative_plugin_dir(
+async def test_agent_turn_runner_parses_inline_skill_activation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("LUCKBOT_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("LUCKBOT_PROJECT_ROOT", str(tmp_path))
+    fake_pm = _FakePluginManager()
+    monkeypatch.setattr(turn_runner_module, "PluginManager", lambda: fake_pm)
+    monkeypatch.setattr(turn_runner_module, "discover_builtin_plugins", lambda: [])
+
+    async def _fake_runtime(spec):
+        assert len(spec.messages) == 1
+        assert isinstance(spec.messages[0], HumanMessage)
+        assert spec.messages[0].content == "hello"
+        assert spec.requested_skill is not None
+        assert spec.requested_skill.skill_name == "demo"
+        return _FakeRuntimeResult(final_text="runtime done", messages=[])
+
+    monkeypatch.setattr(turn_runner_module, "run_runtime", _fake_runtime)
+
+    incoming = _incoming_turn(
+        "[use skill](demo) hello",
+        channel="feishu",
+        transport="webhook",
+        session_key="feishu:ou_x",
+        owner_id="feishu:user:ou_x",
+    )
+
+    result = await AgentTurnRunner().run_turn(incoming)
+
+    assert result.final_text == "runtime done"
+    assert fake_pm.destroyed is True
+
+
+@pytest.mark.asyncio
+async def test_agent_turn_runner_uses_project_relative_plugin_dir(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
     monkeypatch.setenv("LUCKBOT_PROJECT_ROOT", str(tmp_path))
     fake_pm = _FakePluginManager()
-    monkeypatch.setattr(cli_module, "PluginManager", lambda: fake_pm)
-    monkeypatch.setattr(cli_module, "discover_builtin_plugins", lambda: [])
+    monkeypatch.setattr(turn_runner_module, "PluginManager", lambda: fake_pm)
+    monkeypatch.setattr(turn_runner_module, "discover_builtin_plugins", lambda: [])
 
-    pm = await cli_module._build_plugin_manager()
+    async def _raise_runtime(*_args, **_kwargs):
+        raise AssertionError("run_runtime should not be called for slash commands")
 
-    assert pm is fake_pm
+    monkeypatch.setattr(turn_runner_module, "run_runtime", _raise_runtime)
+
+    await AgentTurnRunner().run_turn(_incoming_turn("/help"))
+
     assert fake_pm.initialized_with is not None
     assert fake_pm.initialized_with[1] == [str((tmp_path / ".luckbot" / "plugins").resolve())]
+    assert fake_pm.destroyed is True
 
 
 @pytest.mark.asyncio
-async def test_gateway_session_export_uses_persisted_history(
+async def test_agent_turn_runner_session_export_uses_persisted_history(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("LUCKBOT_STATE_DIR", str(tmp_path))
     fake_pm = _FakePluginManager()
-    monkeypatch.setattr(gateway_service_module, "PluginManager", lambda: fake_pm)
-    monkeypatch.setattr(gateway_service_module, "discover_builtin_plugins", lambda: [])
+    monkeypatch.setattr(turn_runner_module, "PluginManager", lambda: fake_pm)
+    monkeypatch.setattr(turn_runner_module, "discover_builtin_plugins", lambda: [])
 
     async def _raise_runtime(*_args, **_kwargs):
         raise AssertionError("run_runtime should not be called for slash commands")
 
-    monkeypatch.setattr(gateway_service_module, "run_runtime", _raise_runtime)
+    monkeypatch.setattr(turn_runner_module, "run_runtime", _raise_runtime)
 
     session_id = resolve_session("feishu:ou_x").session_id
     lines = messages_to_jsonl_lines(
@@ -375,20 +499,15 @@ async def test_gateway_session_export_uses_persisted_history(
     )
     append_transcript_lines(session_id, lines)
 
-    service = gateway_service_module.LuckBotGatewayService()
-    incoming = IncomingEnvelope(
-        platform="feishu",
-        chat_type="dm",
-        chat_id="oc_x",
-        user_id="ou_x",
-        message_id="om_x",
-        text="/session export --tail 1",
+    incoming = _incoming_turn(
+        "/session export --tail 1",
+        channel="feishu",
+        transport="webhook",
         session_key="feishu:ou_x",
         owner_id="feishu:user:ou_x",
-        target=OutboundTarget(receive_id="ou_x", receive_id_type="open_id"),
     )
 
-    result = await service.run_turn(incoming)
+    result = await AgentTurnRunner().run_turn(incoming)
 
     assert '"role": "assistant"' in result.final_text
     assert '"content": "a1"' in result.final_text

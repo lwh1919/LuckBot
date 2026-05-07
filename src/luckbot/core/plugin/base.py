@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
@@ -20,18 +21,32 @@ VALID_HOOK_NAMES = frozenset(
 )
 
 
+DEFAULT_HOOK_PRIORITY = 1000
+
+
+@dataclass(frozen=True, slots=True)
+class _HookRegistration:
+    priority: int
+    sequence: int
+    handler: Callable[..., Any]
+
+
 class PluginContext:
     """在 :meth:`LuckbotPlugin.initialize` 期间向插件暴露的能力。"""
 
     def __init__(self) -> None:
         self._tools: dict[str, Any] = {}
-        self._hooks: dict[str, list[Callable[..., Any]]] = {n: [] for n in VALID_HOOK_NAMES}
+        self._hooks: dict[str, list[_HookRegistration]] = {
+            n: [] for n in VALID_HOOK_NAMES
+        }
+        self._hook_sequence = 0
         self._services: dict[str, Any] = {}
 
     def reset(self) -> None:
         """清空当前运行时注册表。"""
         self._tools.clear()
         self._hooks = {n: [] for n in VALID_HOOK_NAMES}
+        self._hook_sequence = 0
         self._services.clear()
 
     # -- 工具注册 ---------------------------------------------------
@@ -46,15 +61,29 @@ class PluginContext:
 
     # -- hook 注册 ---------------------------------------------------
 
-    def register_hook(self, hook_name: str, handler: Callable[..., Any]) -> None:
+    def register_hook(
+        self,
+        hook_name: str,
+        handler: Callable[..., Any],
+        *,
+        priority: int = DEFAULT_HOOK_PRIORITY,
+    ) -> None:
         if hook_name not in VALID_HOOK_NAMES:
             raise ValueError(
                 f"未知的 hook「{hook_name}」。合法名称: {sorted(VALID_HOOK_NAMES)}"
             )
-        self._hooks[hook_name].append(handler)
+        self._hooks[hook_name].append(
+            _HookRegistration(
+                priority=priority,
+                sequence=self._hook_sequence,
+                handler=handler,
+            )
+        )
+        self._hook_sequence += 1
+        self._hooks[hook_name].sort(key=lambda item: (item.priority, item.sequence))
 
     def get_hooks(self, hook_name: str) -> list[Callable[..., Any]]:
-        return list(self._hooks.get(hook_name, []))
+        return [item.handler for item in self._hooks.get(hook_name, [])]
 
     # -- 服务注册 ------------------------------------------------
 

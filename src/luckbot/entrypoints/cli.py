@@ -8,6 +8,8 @@ import logging
 import os
 import sys
 import time
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
 
 _log_level = os.getenv("LUCKBOT_LOG_LEVEL", "WARNING").upper()
@@ -20,43 +22,36 @@ from rich.panel import Panel
 from rich.rule import Rule
 from rich.text import Text
 
-from luckbot.plugins.builtin import discover_builtin_plugins
-from luckbot.core.config import resolve_project_path
 from luckbot.core.config.env_parse import env_int
-from luckbot.core.runtime.agent_loop import DEFAULT_MAX_STEPS, agent_loop
+from luckbot.core.runtime import DEFAULT_MAX_STEPS
 from luckbot.domains.memory.paths import clear_memory_store, resolve_memory_paths
 from luckbot.core.observability import init_observability
-from luckbot.core.plugin.manager import PluginManager
-from luckbot.domains.session import build_local_session_key, normalize_session_name
-from luckbot.domains.session.state import resolve_session
-from luckbot.domains.session.transcript import load_transcript_messages
-from luckbot.application.commands import CommandContext, execute_command
-from luckbot.application.prompt import SYSTEM_PROMPT
-from luckbot.application.services import (
+from luckbot.domains.session import build_local_session_key, default_owner_id, normalize_session_name
+from luckbot.application.gateway import (
     GatewayClientError,
     read_gateway_logs,
     read_gateway_status,
     resolve_gateway_base_url,
-    send_gateway_command,
     send_gateway_turn,
     start_gateway_process,
     stop_gateway_process,
+    use_gateway_base_url,
 )
+from luckbot.application.turn_runner import AgentTurnRunner
+from luckbot.application.turns import IncomingTurn
 
 _console = Console()
 
 
+@dataclass(slots=True)
+class CliTurnResult:
+    final_text: str
+    conversation_history: list[Any]
+    is_command: bool
+
+
 def _max_steps_from_env() -> int:
     return max(1, env_int("LUCKBOT_RECURSION_LIMIT", DEFAULT_MAX_STEPS))
-
-
-def _session_persist_enabled() -> bool:
-    return os.getenv("LUCKBOT_SESSION_PERSIST", "1").strip().lower() not in {
-        "0",
-        "false",
-        "no",
-        "off",
-    }
 
 
 def _local_session_name() -> str:
@@ -64,23 +59,13 @@ def _local_session_name() -> str:
 
 
 def _local_owner_id() -> str:
-    return (os.getenv("LUCKBOT_OWNER_ID") or "local").strip() or "local"
+    return default_owner_id()
 
 
 def _gateway_auto_start_enabled() -> bool:
     return os.getenv("LUCKBOT_GATEWAY_AUTOSTART", "1").strip().lower() not in {
         "0",
-        "false",
-        "no",
-        "off",
     }
-
-
-def _initial_conversation_history(session_key: str) -> list[Any]:
-    if not _session_persist_enabled():
-        return []
-    meta = resolve_session(session_key)
-    return load_transcript_messages(meta.session_id)
 
 
 def _print_banner(session_name: str, *, mode: str = "local") -> None:
@@ -112,53 +97,45 @@ def _print_command_result(result: str) -> None:
     _console.print()
 
 
-async def _build_plugin_manager() -> PluginManager:
-    pm = PluginManager()
-    await pm.initialize(
-        plugins=discover_builtin_plugins(),
-        plugin_dirs=[resolve_project_path(".luckbot/plugins")],
-    )
-    return pm
+def _read_user_input() -> str | None:
+    try:
+        user_input = _console.input("[bold green]你>[/bold green] ").strip()
+    except (EOFError, KeyboardInterrupt):
+        _console.print("\n[dim]已退出。[/dim]")
+        return None
+
+    if user_input.lower() in {"quit", "exit"}:
+        _console.print("[dim]已退出。[/dim]")
+        return None
+    return user_input
 
 
-async def _handle_user_input(
-    user_input: str,
+def _print_turn_result(result: CliTurnResult) -> None:
+    if result.is_command:
+        _print_command_result(result.final_text)
+    else:
+        _print_agent_result(result.final_text)
+
+
+async def _chat_loop(
+    send_turn: Callable[[str], Awaitable[CliTurnResult]],
     *,
-    pm: PluginManager,
-    conversation_history: list[Any],
-    session_key: str,
-    owner_id: str | None = None,
-    max_steps: int,
-) -> tuple[str, list[Any], bool]:
-    command_result = await execute_command(
-        user_input,
-        CommandContext(
-            transport="cli",
-            plugin_manager=pm,
-            conversation_history=conversation_history,
-            session_key=session_key,
-            owner_id=owner_id,
-        ),
-    )
-    if command_result.handled:
-        return (
-            command_result.final_text,
-            command_result.updated_conversation_history
-            if command_result.updated_conversation_history is not None
-            else conversation_history,
-            True,
-        )
+    handled_exceptions: tuple[type[BaseException], ...] = (Exception,),
+) -> None:
+    while True:
+        user_input = _read_user_input()
+        if user_input is None:
+            break
+        if not user_input:
+            continue
 
-    result, updated_history = await agent_loop(
-        user_input,
-        pm,
-        system_prompt=SYSTEM_PROMPT,
-        conversation_history=conversation_history,
-        session_key=session_key,
-        owner_id=owner_id,
-        max_steps=max_steps,
-    )
-    return result, updated_history, False
+        try:
+            result = await send_turn(user_input)
+        except handled_exceptions as exc:
+            _console.print(f"[red]执行失败:[/red] {exc}")
+            continue
+
+        _print_turn_result(result)
 
 
 async def async_chat() -> None:
@@ -169,88 +146,49 @@ async def async_chat() -> None:
     session_key = build_local_session_key(session_name)
 
     _print_banner(session_name, mode="local")
-    pm = await _build_plugin_manager()
-    conversation_history: list[Any] = _initial_conversation_history(session_key)
-    if conversation_history:
-        _console.print(f"[dim]已从磁盘恢复会话消息 {len(conversation_history)} 条。[/dim]")
+    runner = AgentTurnRunner(max_steps=_max_steps_from_env())
 
-    try:
-        while True:
-            try:
-                user_input = _console.input("[bold green]你>[/bold green] ").strip()
-            except (EOFError, KeyboardInterrupt):
-                _console.print("\n[dim]已退出。[/dim]")
-                break
+    async def _send_local_turn(user_input: str) -> CliTurnResult:
+        result = await runner.run_turn(
+            IncomingTurn(
+                channel="cli",
+                transport="local",
+                text=user_input,
+                session_key=session_key,
+                owner_id=_local_owner_id(),
+                chat_id=session_name,
+                user_id=_local_owner_id(),
+            )
+        )
+        return CliTurnResult(
+            final_text=result.final_text,
+            conversation_history=result.messages,
+            is_command=result.handled_as_command,
+        )
 
-            if not user_input:
-                continue
-            if user_input.lower() in {"quit", "exit"}:
-                _console.print("[dim]已退出。[/dim]")
-                break
-
-            try:
-                result, conversation_history, handled = await _handle_user_input(
-                    user_input,
-                    pm=pm,
-                    conversation_history=conversation_history,
-                    session_key=session_key,
-                    max_steps=_max_steps_from_env(),
-                )
-            except Exception as exc:
-                _console.print(f"[red]执行失败:[/red] {exc}")
-                continue
-
-            if handled:
-                _print_command_result(result)
-            else:
-                _print_agent_result(result)
-    finally:
-        await pm.destroy()
+    await _chat_loop(_send_local_turn)
 
 
 async def async_chat_gateway() -> None:
     load_dotenv()
     init_observability(component="cli-gateway")
-    _ensure_gateway_running()
     session_name = _local_session_name()
     _print_banner(session_name, mode="gateway")
 
-    while True:
-        try:
-            user_input = _console.input("[bold green]你>[/bold green] ").strip()
-        except (EOFError, KeyboardInterrupt):
-            _console.print("\n[dim]已退出。[/dim]")
-            break
+    async def _send_gateway_turn(user_input: str) -> CliTurnResult:
+        result = await asyncio.to_thread(
+            send_gateway_turn,
+            user_input,
+            session_name=session_name,
+            owner_id=_local_owner_id(),
+        )
+        return CliTurnResult(
+            final_text=result.final_text,
+            conversation_history=[],
+            is_command=user_input.startswith("/"),
+        )
 
-        if not user_input:
-            continue
-        if user_input.lower() in {"quit", "exit"}:
-            _console.print("[dim]已退出。[/dim]")
-            break
-
-        try:
-            if user_input.startswith("/"):
-                result = await asyncio.to_thread(
-                    send_gateway_command,
-                    user_input,
-                    session_name=session_name,
-                    owner_id=_local_owner_id(),
-                )
-            else:
-                result = await asyncio.to_thread(
-                    send_gateway_turn,
-                    user_input,
-                    session_name=session_name,
-                    owner_id=_local_owner_id(),
-                )
-        except GatewayClientError as exc:
-            _console.print(f"[red]执行失败:[/red] {exc}")
-            continue
-
-        if user_input.startswith("/"):
-            _print_command_result(result.final_text)
-        else:
-            _print_agent_result(result.final_text)
+    await _chat_loop(_send_gateway_turn, handled_exceptions=(GatewayClientError,))
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -258,30 +196,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         description="LuckBot：交互对话与本地记忆管理（配置见 .env / .env.example）。",
         epilog="不带子命令时进入交互对话。",
     )
-    sub = parser.add_subparsers(dest="cmd")
-
-    chat_p = sub.add_parser("chat", help="进入交互式对话。")
-    chat_p.add_argument(
-        "--gateway",
-        action="store_true",
-        help="通过正在运行的 gateway 进行对话。",
-    )
+    sub = parser.add_subparsers(dest="command")
 
     ask_p = sub.add_parser("ask", help="执行单次提问。")
     ask_p.add_argument("prompt", nargs="+", help="要发送的 prompt。")
-    ask_p.add_argument(
-        "--gateway",
-        action="store_true",
-        help="通过正在运行的 gateway 执行单次提问。",
-    )
-
-    cmd_p = sub.add_parser("cmd", help="执行共享 slash 命令。")
-    cmd_p.add_argument("command", nargs="+", help="如 /skill list")
-    cmd_p.add_argument(
-        "--gateway",
-        action="store_true",
-        help="通过正在运行的 gateway 执行 slash 命令。",
-    )
+    ask_p.set_defaults(handler=_run_ask_from_args)
 
     mem = sub.add_parser("memory", help="本地记忆目录与索引")
     mem_sub = mem.add_subparsers(dest="memory_action", required=True)
@@ -295,19 +214,24 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="跳过确认（脚本 / 自动化测试用）",
     )
+    clear_p.set_defaults(handler=_run_memory_from_args)
 
-    gateway = sub.add_parser("gateway", help="gateway 进程管理。")
-    gateway_sub = gateway.add_subparsers(dest="gateway_action", required=True)
-    gateway_sub.add_parser("serve", help="启动 gateway 服务。")
-    gateway_sub.add_parser("start", help="后台启动 gateway 服务。")
-    gateway_sub.add_parser("stop", help="停止后台 gateway 服务。")
-    gateway_sub.add_parser("status", help="查看 gateway 状态。")
-    logs_p = gateway_sub.add_parser("logs", help="查看 gateway 日志。")
-    logs_p.add_argument(
+    gateway = sub.add_parser(
+        "gateway",
+        help="进入 gateway 对话或管理 gateway 进程。",
+        description="不带参数时启动或复用本地 gateway；传 URL 时连接外部 gateway。",
+    )
+    gateway.add_argument(
+        "target",
+        nargs="?",
+        help="start / stop / status / logs，或远程 gateway URL。",
+    )
+    gateway.add_argument(
         "--follow",
         action="store_true",
-        help="持续跟随日志输出，Ctrl+C 退出。",
+        help="target 为 logs 时持续跟随日志输出，Ctrl+C 退出。",
     )
+    gateway.set_defaults(handler=_run_gateway_from_args)
     return parser
 
 
@@ -332,48 +256,25 @@ async def _run_once(text: str) -> int:
     session_name = _local_session_name()
     os.environ["LUCKBOT_SESSION"] = session_name
     session_key = build_local_session_key(session_name)
-    pm = await _build_plugin_manager()
-    conversation_history = _initial_conversation_history(session_key)
-    try:
-        result, _history, handled = await _handle_user_input(
-            text,
-            pm=pm,
-            conversation_history=conversation_history,
+    result = await AgentTurnRunner(max_steps=_max_steps_from_env()).run_turn(
+        IncomingTurn(
+            channel="cli",
+            transport="local",
+            text=text,
             session_key=session_key,
-            max_steps=_max_steps_from_env(),
+            owner_id=_local_owner_id(),
+            chat_id=session_name,
+            user_id=_local_owner_id(),
         )
-    finally:
-        await pm.destroy()
+    )
 
-    if handled:
-        _print_command_result(result)
-    else:
-        _print_agent_result(result)
-    return 0
-
-
-async def _run_once_gateway(text: str, *, as_command: bool) -> int:
-    _ensure_gateway_running()
-    session_name = _local_session_name()
-    try:
-        if as_command:
-            result = await asyncio.to_thread(
-                send_gateway_command,
-                text,
-                session_name=session_name,
-                owner_id=_local_owner_id(),
-            )
-            _print_command_result(result.final_text)
-        else:
-            result = await asyncio.to_thread(
-                send_gateway_turn,
-                text,
-                session_name=session_name,
-                owner_id=_local_owner_id(),
-            )
-            _print_agent_result(result.final_text)
-    except GatewayClientError as exc:
-        raise SystemExit(f"gateway 执行失败: {exc}") from exc
+    _print_turn_result(
+        CliTurnResult(
+            final_text=result.final_text,
+            conversation_history=result.messages,
+            is_command=result.handled_as_command,
+        )
+    )
     return 0
 
 
@@ -383,7 +284,7 @@ def _ensure_gateway_running() -> None:
         return
     if not _gateway_auto_start_enabled():
         raise SystemExit(
-            "gateway 未运行，请先执行 `luckbot gateway start` 或 `python main.py gateway start`。"
+            "gateway 未运行，请先执行 `luckbot gateway start`。"
         )
     try:
         start_gateway_process()
@@ -432,57 +333,53 @@ def _run_gateway_logs(*, follow: bool) -> None:
         _console.print("\n[dim]已停止跟随日志。[/dim]")
 
 
+def _run_ask_from_args(args: argparse.Namespace) -> None:
+    prompt = " ".join(args.prompt).strip()
+    if not prompt:
+        raise SystemExit("prompt 不能为空")
+    raise SystemExit(asyncio.run(_run_once(prompt)))
+
+
+def _run_memory_from_args(args: argparse.Namespace) -> None:
+    if args.memory_action == "clear":
+        _run_memory_clear(yes=bool(args.yes))
+
+
+def _run_gateway_from_args(args: argparse.Namespace) -> None:
+    target = (args.target or "").strip()
+    if not target:
+        _ensure_gateway_running()
+        asyncio.run(async_chat_gateway())
+        return
+    if target == "start":
+        status = start_gateway_process()
+        _console.print(f"[green]gateway 已启动[/green] PID={status.pid} URL={resolve_gateway_base_url()}")
+        return
+    if target == "stop":
+        status = stop_gateway_process()
+        _console.print(
+            "[green]gateway 已停止[/green]" if not status.running else "[yellow]gateway 仍在运行[/yellow]"
+        )
+        return
+    if target == "status":
+        _run_gateway_status()
+        return
+    if target == "logs":
+        _run_gateway_logs(follow=bool(args.follow))
+        return
+
+    use_gateway_base_url(target)
+    asyncio.run(async_chat_gateway())
+
+
 def main() -> None:
     load_dotenv()
     parser = _build_arg_parser()
     args = parser.parse_args()
 
-    if getattr(args, "cmd", None) == "memory" and args.memory_action == "clear":
-        _run_memory_clear(yes=bool(args.yes))
-        return
-
-    if getattr(args, "cmd", None) == "ask":
-        prompt = " ".join(args.prompt).strip()
-        if not prompt:
-            raise SystemExit("prompt 不能为空")
-        if bool(args.gateway):
-            raise SystemExit(asyncio.run(_run_once_gateway(prompt, as_command=False)))
-        raise SystemExit(asyncio.run(_run_once(prompt)))
-
-    if getattr(args, "cmd", None) == "cmd":
-        command = " ".join(args.command).strip()
-        if not command.startswith("/"):
-            raise SystemExit("cmd 仅接受 slash 命令，例如 /skill list")
-        if bool(args.gateway):
-            raise SystemExit(asyncio.run(_run_once_gateway(command, as_command=True)))
-        raise SystemExit(asyncio.run(_run_once(command)))
-
-    if getattr(args, "cmd", None) == "gateway":
-        action = args.gateway_action
-        if action == "serve":
-            from luckbot.adapters.gateway.app import main as gateway_main
-
-            gateway_main()
-            return
-        if action == "start":
-            status = start_gateway_process()
-            _console.print(f"[green]gateway 已启动[/green] PID={status.pid} URL={resolve_gateway_base_url()}")
-            return
-        if action == "stop":
-            status = stop_gateway_process()
-            _console.print(
-                "[green]gateway 已停止[/green]" if not status.running else "[yellow]gateway 仍在运行[/yellow]"
-            )
-            return
-        if action == "status":
-            _run_gateway_status()
-            return
-        if action == "logs":
-            _run_gateway_logs(follow=bool(args.follow))
-            return
-
-    if getattr(args, "cmd", None) == "chat" and bool(args.gateway):
-        asyncio.run(async_chat_gateway())
+    handler = getattr(args, "handler", None)
+    if handler is not None:
+        handler(args)
         return
 
     asyncio.run(async_chat())

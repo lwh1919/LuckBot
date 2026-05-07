@@ -2,7 +2,7 @@
 
 ## Agent Loop
 
-指 LuckBot 的主运行循环，即 `agent_loop()` 与 `run_react_loop()` 所承载的生命周期与 ReAct 执行骨架。
+指 LuckBot 一次 agent run 的生命周期与 ReAct 执行骨架。当前完整生命周期由 `run_runtime()` 承载，LLM/tool 交替执行由 `run_react_loop()` 承载。
 
 ## Plugin
 

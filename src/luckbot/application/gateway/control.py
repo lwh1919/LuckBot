@@ -1,4 +1,4 @@
-"""Local process management for the LuckBot gateway."""
+"""Local process management for a development LuckBot gateway."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from luckbot.application.services.gateway_client import gateway_healthcheck, resolve_gateway_base_url
+from luckbot.application.gateway.client import gateway_healthcheck, resolve_gateway_base_url
 from luckbot.domains.session.state import resolve_state_dir
 
 _START_TIMEOUT_SECONDS = 8.0
@@ -58,7 +58,6 @@ def gateway_port() -> int:
 
 
 def read_gateway_status() -> GatewayProcessStatus:
-    runtime_dir = gateway_runtime_dir()
     pid_path = gateway_pid_path()
     state_path = gateway_state_path()
     log_path = gateway_log_path()
@@ -66,7 +65,6 @@ def read_gateway_status() -> GatewayProcessStatus:
     pid = _read_pid(pid_path)
     state = _read_state(state_path)
     running = pid is not None and _pid_alive(pid)
-    detail = ""
     if pid is None:
         detail = "gateway 未运行"
     elif not running:
@@ -99,7 +97,11 @@ def start_gateway_process() -> GatewayProcessStatus:
 
     log_path = gateway_log_path()
     project_root = Path(__file__).resolve().parents[4]
-    command = [sys.executable, str(project_root / "main.py"), "gateway", "serve"]
+    command = [
+        sys.executable,
+        "-m",
+        "luckbot.adapters.gateway.app",
+    ]
 
     log_handle = log_path.open("a", encoding="utf-8")
     try:

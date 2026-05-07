@@ -24,6 +24,7 @@ from luckbot.core.plugin.hooks import (
     BeforeRunInput,
     BeforeRunResult,
 )
+from luckbot.domains.skills.prompt import build_skill_prompt
 from luckbot.domains.skills.registry import SkillRegistry
 from luckbot.domains.skills.state import SkillStateStore
 from luckbot.domains.skills.workspace import SkillWorkspace
@@ -67,52 +68,11 @@ class SkillsPlugin(LuckbotPlugin):
 
     async def _before_llm_call(self, inp: BeforeLLMCallInput) -> BeforeLLMCallResult | None:
         """CQRS 读取方：将 L0 + L1 + L2 注入 system prompt。"""
-        parts: list[str] = []
-        state = self._state_store.snapshot()
-
-        # L0：始终注入 skill 概览（含 when_to_use 触发条件）
-        skills = self._registry.all_skills()
-        if skills:
-            lines: list[str] = []
-            for s in skills:
-                entry = f"  - {s.name}: {s.description[:200]}"
-                if s.when_to_use:
-                    entry += f"\n    适用场景: {s.when_to_use}"
-                lines.append(entry)
-            listing = "\n".join(lines)
-            parts.append(
-                f"可用技能列表:\n{listing}\n"
-                f"请使用 skill_load 加载技能，并按技能说明操作。"
-            )
-
-        # L1：注入已加载 skill 的 body
-        for name in state.loaded:
-            skill = self._registry.resolve(name)
-            if skill is None:
-                continue
-            parts.append(f"--- 已加载技能: {skill.name} ---\n{skill.content}")
-            if skill.docs:
-                doc_list = "\n".join(
-                    f"  - {d.name}: {d.description}" for d in skill.docs
-                )
-                parts.append(
-                    f"可参考文档（用 skill_select_docs 加载）:\n{doc_list}"
-                )
-
-        # L2：注入已选文档内容
-        for skill_name, doc_names in state.selected_docs.items():
-            for doc_name in doc_names:
-                content = self._registry.load_doc(skill_name, doc_name)
-                if content is None:
-                    continue
-                parts.append(
-                    f"--- 参考文档: {skill_name}/{doc_name} ---\n{content}"
-                )
-
-        if not parts:
+        skill_prompt = build_skill_prompt(self._registry, self._state_store.snapshot())
+        if not skill_prompt:
             return None
 
-        new_prompt = inp.system_prompt + "\n\n" + "\n\n".join(parts)
+        new_prompt = inp.system_prompt + "\n\n" + skill_prompt
         return BeforeLLMCallResult(system_prompt=new_prompt)
 
     # ── 工具构造 ────────────────────────────────────────────────────
@@ -152,14 +112,12 @@ class SkillsPlugin(LuckbotPlugin):
             skill = registry.resolve(skill_name)
             if skill is None:
                 return f"未找到名为「{skill_name}」的 skill。"
-            ok, invalid = registry.validate_docs(skill_name, docs)
+            invalid = registry.invalid_docs(skill_name, docs)
             if invalid:
                 return (
                     f"文档不存在: {invalid}。"
                     f"可用文档: {sorted(registry.doc_names(skill_name))}"
                 )
-            if not ok:
-                return f"文档校验失败: {invalid}"
             state.select_docs(skill_name, docs)
             return f"已选择 {len(docs)} 个文档，内容将在后续对话中可用: {docs}"
 

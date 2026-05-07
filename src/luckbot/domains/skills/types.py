@@ -29,12 +29,11 @@ class SkillInfo:
 
 
 @dataclass
-class RemoteSkillRequest:
-    """单次 run 的远程/预置 skill 请求。"""
+class SkillActivationRequest:
+    """单次 run 的 skill 激活请求。"""
 
     skill_name: str
     docs: list[str] = field(default_factory=list)
-    source: str = "remote"
 
 
 @dataclass
@@ -48,15 +47,10 @@ class ExecResult:
     duration_ms: int
     output_files: dict[str, str] = field(default_factory=dict)
 
-    @property
-    def returncode(self) -> int:
-        """兼容旧调用方。"""
-        return self.exit_code
-
 
 @dataclass
 class SkillState:
-    """CQRS 临时状态，每次 agent_loop 调用时重置。"""
+    """CQRS 临时状态，每次 runtime run 调用时重置。"""
 
     loaded: dict[str, bool] = field(default_factory=dict)
     selected_docs: dict[str, list[str]] = field(default_factory=dict)

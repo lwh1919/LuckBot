@@ -1,4 +1,4 @@
-"""Memory Flush subagent：memory 领域适配层 + 通用 subagent runtime。"""
+"""Memory Flush：memory 领域适配层 + 统一 runtime。"""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from typing import Any
 from langchain_core.messages import HumanMessage
 from langchain_core.tools import tool
 
+from luckbot.core.observability import log_exception
 from luckbot.domains.memory.embeddings import EmbeddingProvider
 from luckbot.domains.memory.index_db import MemoryIndex
 from luckbot.domains.memory.memory_tools import (
@@ -17,14 +18,12 @@ from luckbot.domains.memory.memory_tools import (
     build_memory_search_tool,
 )
 from luckbot.domains.memory.paths import (
-    is_allowed_memory_read_rel,
-    is_under_memory_root,
     resolve_memory_read_path,
     resolve_memory_write_path,
 )
 from luckbot.domains.memory.types import MemoryPaths
 from luckbot.core.plugin.base import LuckbotPlugin, PluginContext
-from luckbot.core.subagent import SubagentRunRequest, run_subagent
+from luckbot.core.runtime import RuntimeContext, RuntimeProfile, run_runtime
 
 logger = logging.getLogger(__name__)
 
@@ -35,8 +34,9 @@ MEMORY_FLUSH_AGENT_SYSTEM = (
     "**本轮 flush 的首要落盘目标**是系统消息给出的 **`memory/YYYY-MM-DD.md`**（与当日 UTC 日期同名的单文件，"
     "逻辑路径形如 `memory/2026-04-12.md`，具体文件名见下方的「本回默认日文件」）。\n"
     "建议：需要对照既有笔记时先用 memory_search / memory_get / memory_read；"
-    "再把值得持久保存的内容写入该日文件（可 append 到文末或新建该文件）。\n"
-    "仅在确有必要时才额外更新 MEMORY.md 或其它 `memory/*.md`（例如合并全局偏好、修正已有日文件中的待办状态）。\n"
+    "再把值得持久保存的内容写入该日文件；memory_write 默认追加到文末。\n"
+    "仅在确有必要时才额外更新 MEMORY.md 或其它 `memory/*.md`（例如合并全局偏好、修正已有日文件中的待办状态）。"
+    "只有明确要重写整文件时才使用 mode=overwrite。\n"
     "不要编造对话中未出现的内容；不要输出与落盘无关的长篇说明。\n"
     f"若没有任何需要持久化的信息，最终回复必须且只能为：{NO_MEMORIES_TOKEN}"
 )
@@ -51,11 +51,9 @@ def _build_memory_flush_read_tool(paths: MemoryPaths) -> Any:
     ) -> str:
         """读取记忆目录下的 Markdown（逻辑路径如 MEMORY.md、memory/2026-04-11.md）。offset 为起始行号（1-based），limit 为行数（0=读到末尾）。"""
         rel = rel_path.strip().replace("\\", "/")
-        if not is_allowed_memory_read_rel(rel, paths):
-            return f"[错误] path 不允许: {rel_path}"
         p = resolve_memory_read_path(rel, paths)
         if p is None or not p.is_file():
-            return f"[错误] 文件不存在: {rel_path}"
+            return f"[错误] 文件不存在或不允许: {rel_path}"
         try:
             lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
         except OSError as exc:
@@ -84,18 +82,16 @@ def _build_memory_flush_write_tool(paths: MemoryPaths) -> Any:
     async def memory_write(
         rel_path: str,
         content: str,
-        mode: str = "overwrite",
+        mode: str = "append",
     ) -> str:
-        """写入 memory白名单内的 .md。mode 为 overwrite（整文件替换）或 append（追加到文末）。"""
+        """写入 memory 白名单内的 .md。mode 默认为 append；显式 overwrite 才整文件替换。"""
         rel = rel_path.strip().replace("\\", "/")
         p = resolve_memory_write_path(rel, paths)
         if p is None:
             return f"[错误] path 不允许: {rel_path}"
-        if not is_under_memory_root(p, paths):
-            return "[错误] 路径越界"
         if len(content) > MAX_MEMORY_WRITE_CHARS:
             return f"[错误] 内容过长（>{MAX_MEMORY_WRITE_CHARS} 字符）"
-        m = (mode or "overwrite").strip().lower()
+        m = (mode or "append").strip().lower()
         try:
             p.parent.mkdir(parents=True, exist_ok=True)
             if m == "append":
@@ -128,8 +124,6 @@ def _build_memory_flush_edit_tool(paths: MemoryPaths) -> Any:
         p = resolve_memory_write_path(rel, paths)
         if p is None:
             return f"[错误] path 不允许: {rel_path}"
-        if not is_under_memory_root(p, paths):
-            return "[错误] 路径越界"
         if not p.is_file():
             return f"[错误] 文件不存在: {rel_path}"
         try:
@@ -194,7 +188,7 @@ def _build_memory_flush_system_prompt(day: str) -> str:
 def _build_memory_flush_user_message(transcript: str, day: str) -> str:
     return (
         f"以下是对话摘录。请**优先**把值得长期保留的信息写入 **memory/{day}.md** "
-        "（与系统消息中的默认日文件一致；可用 memory_write 的 append 或 overwrite）。\n\n---\n"
+        "（与系统消息中的默认日文件一致；memory_write 默认 append，必要时才显式 overwrite）。\n\n---\n"
         + transcript
     )
 
@@ -208,20 +202,24 @@ async def run_memory_flush_agent(
     max_steps: int,
     day: str,
 ) -> tuple[str, list[Any]]:
-    """执行 memory flush subagent；结束后 ``index.sync()``。"""
-    request = SubagentRunRequest(
-        system_prompt=_build_memory_flush_system_prompt(day),
-        messages=[
-            HumanMessage(content=_build_memory_flush_user_message(transcript, day))
-        ],
-        max_steps=max_steps,
-        plugins=[MemoryFlushToolsPlugin(memory_paths, index, provider)],
+    """执行 memory flush runtime run；结束后 ``index.sync()``。"""
+    result = await run_runtime(
+        RuntimeContext(
+            system_prompt=_build_memory_flush_system_prompt(day),
+            messages=[
+                HumanMessage(content=_build_memory_flush_user_message(transcript, day))
+            ],
+            max_steps=max_steps,
+            profile=RuntimeProfile(
+                plugins=[MemoryFlushToolsPlugin(memory_paths, index, provider)],
+                enable_run_hooks=False,
+            ),
+        )
     )
-    result = await run_subagent(request)
     try:
         await index.sync()
-    except Exception:
-        logger.exception("flush 后 memory sync 失败")
+    except Exception as exc:
+        log_exception(logger, "memory.flush_sync_failed", exc)
     return result.final_text, result.messages
 
 
